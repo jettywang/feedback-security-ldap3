@@ -1,0 +1,29 @@
+# Strict MIT krb5 client configuration (POSIX). Pair with strict_kerberos_client.py.
+#
+# Why: even when ldap3 hands gssapi the correct configured hostname, the GSS
+# layer may itself canonicalize names via DNS before requesting the ticket.
+# Lock that down so the SPN is built from the name ldap3 passed, verbatim.
+
+[libdefaults]
+    default_realm = CORP.EXAMPLE.COM
+    dns_lookup_realm = false
+    dns_lookup_kdc = false
+    rdns = false
+    # krb5 >= 1.18 spelling of the same control; keep both for mixed versions
+    dns_canonicalize_hostname = false
+    canonicalize = false
+    udp_preference_limit = 1
+    default_tkt_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96
+    default_tgs_enctypes = aes256-cts-hmac-sha1-96 aes128-cts-hmac-sha1-96
+    # require mutual authentication so a fake server cannot complete the exchange
+    mutual = true
+
+[realms]
+    CORP.EXAMPLE.COM = {
+        kdc = kdc1.corp.example.com
+        admin_server = kdc1.corp.example.com
+    }
+
+[domain_realm]
+    .corp.example.com = CORP.EXAMPLE.COM
+    corp.example.com = CORP.EXAMPLE.COM

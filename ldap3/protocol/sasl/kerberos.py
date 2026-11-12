@@ -95,9 +95,11 @@ def sasl_gssapi(connection, controls):
     sasl_credentials can be empty or a tuple with one or two elements.
     The first element determines which service principal to request a ticket for and can be one of the following:
 
-    - None or False, to use the hostname from the Server object
-    - True to perform a reverse DNS lookup to retrieve the canonical hostname for the hosts IP address
-    - A string containing the hostname
+    - None or False, to use the hostname from the Server object (equivalent to ReverseDnsSetting.OFF)
+    - True to perform a required reverse DNS lookup of the peer's IP address (legacy equivalent of
+      ReverseDnsSetting.REQUIRE_RESOLVE_ALL_ADDRESSES)
+    - a ReverseDnsSetting value (integer 0-4) selecting one of the OFF / REQUIRE_* / OPTIONAL_* reverse DNS modes
+    - a string containing the hostname to authenticate against (pinned; no reverse DNS is performed)
 
     The optional second element is what authorization ID to request.
 

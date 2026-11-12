@@ -27,11 +27,16 @@ import socket
 
 
 class ReverseDnsSetting(object):
-    OFF = 0,
-    REQUIRE_RESOLVE_ALL_ADDRESSES = 1,
-    REQUIRE_RESOLVE_IP_ADDRESSES_ONLY = 2,
-    OPTIONAL_RESOLVE_ALL_ADDRESSES = 3,
-    OPTIONAL_RESOLVE_IP_ADDRESSES_ONLY = 4,
+    # these must be plain ints: they are compared against the values users pass
+    # in sasl_credentials, and the kerberos selector checks them with "==".
+    # Trailing commas previously made each member a one-element tuple so only
+    # the enum members themselves (never their documented integer values)
+    # matched, and ReverseDnsSetting.OFF became truthy.
+    OFF = 0
+    REQUIRE_RESOLVE_ALL_ADDRESSES = 1
+    REQUIRE_RESOLVE_IP_ADDRESSES_ONLY = 2
+    OPTIONAL_RESOLVE_ALL_ADDRESSES = 3
+    OPTIONAL_RESOLVE_IP_ADDRESSES_ONLY = 4
     SUPPORTED_VALUES = {OFF, REQUIRE_RESOLVE_ALL_ADDRESSES, REQUIRE_RESOLVE_IP_ADDRESSES_ONLY,
                         OPTIONAL_RESOLVE_ALL_ADDRESSES, OPTIONAL_RESOLVE_IP_ADDRESSES_ONLY}
 

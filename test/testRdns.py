@@ -35,11 +35,18 @@ class Test(unittest.TestCase):
         fail_msg = ('Changing the mapping of reverse dns enum types to numeric values will break backwards '
                     'compatibility for existing clients on older versions of the ldap3 package. If new enum types '
                     'are added or functionally changed, please use new values')
-        self.assertEqual(ReverseDnsSetting.OFF, (0,), fail_msg)
-        self.assertEqual(ReverseDnsSetting.REQUIRE_RESOLVE_ALL_ADDRESSES, (1,), fail_msg)
-        self.assertEqual(ReverseDnsSetting.REQUIRE_RESOLVE_IP_ADDRESSES_ONLY, (2,), fail_msg)
-        self.assertEqual(ReverseDnsSetting.OPTIONAL_RESOLVE_ALL_ADDRESSES, (3,), fail_msg)
-        self.assertEqual(ReverseDnsSetting.OPTIONAL_RESOLVE_IP_ADDRESSES_ONLY, (4,), fail_msg)
+        # members must be plain ints; a trailing comma used to turn them into
+        # one-element tuples, which broke the documented integer semantics
+        self.assertEqual(ReverseDnsSetting.OFF, 0, fail_msg)
+        self.assertEqual(ReverseDnsSetting.REQUIRE_RESOLVE_ALL_ADDRESSES, 1, fail_msg)
+        self.assertEqual(ReverseDnsSetting.REQUIRE_RESOLVE_IP_ADDRESSES_ONLY, 2, fail_msg)
+        self.assertEqual(ReverseDnsSetting.OPTIONAL_RESOLVE_ALL_ADDRESSES, 3, fail_msg)
+        self.assertEqual(ReverseDnsSetting.OPTIONAL_RESOLVE_IP_ADDRESSES_ONLY, 4, fail_msg)
+        self.assertIsInstance(ReverseDnsSetting.OFF, int)
+        self.assertFalse(ReverseDnsSetting.OFF, 'OFF must be falsy so the legacy False branch and OFF behave alike')
+        # the documented integer literals must be accepted values too
+        for literal in range(5):
+            self.assertTrue(literal in ReverseDnsSetting.SUPPORTED_VALUES)
 
         fail_msg = ('Removing values from the set of supported values for reverse dns settings will break '
                     'backwards compatibility for existing clients on older versions of the ldap3 package. '

@@ -1,0 +1,70 @@
+======================================================================================================================
+BACKEND: posix
+======================================================================================================================
+case                                   server.host              peer       sasl_credentials[0]                           rDNS  GSS target name                       outcome
+----------------------------------------------------------------------------------------------------------------------
+default (no credentials)               ldap.example.com         10.0.0.10  None                                          0     ldap@ldap.example.com                 OK
+explicit False (legacy OFF)            ldap.example.com         10.0.0.10  False                                         0     ldap@ldap.example.com                 OK
+explicit string override               ldap.example.com         10.0.0.10  'ldap-3.example.com'                          0     ldap@ldap-3.example.com               OK
+legacy True (require reverse)          ldap.example.com         10.0.0.10  True                                          2     ldap@ldap-3.internal.example.com      OK
+enum OFF                               ldap.example.com         10.0.0.10  (0,)                                          0     ldap@ldap.example.com                 OK
+enum REQUIRE_ALL                       ldap.example.com         10.0.0.10  (1,)                                          2     ldap@ldap-3.internal.example.com      OK
+enum REQUIRE_IP_ONLY (host=name)       ldap.example.com         10.0.0.10  (2,)                                          0     ldap@ldap.example.com                 OK
+enum OPTIONAL_ALL                      ldap.example.com         10.0.0.10  (3,)                                          2     ldap@ldap-3.internal.example.com      OK
+enum OPTIONAL_IP_ONLY (host=name)      ldap.example.com         10.0.0.10  (4,)                                          0     ldap@ldap.example.com                 OK
+raw integer 0 (OFF literal)            ldap.example.com         10.0.0.10  0                                             0     ldap@ldap.example.com                 OK
+raw integer 1 (REQUIRE_ALL literal)    ldap.example.com         10.0.0.10  1                                             0     -                                     TypeError: can only concatenate str (not "int") to str
+raw integer 3 (OPTIONAL_ALL literal)   ldap.example.com         10.0.0.10  3                                             0     -                                     TypeError: can only concatenate str (not "int") to str
+REQUIRE_ALL + PTR failure              ldap.example.com         10.0.0.99  (1,)                                          1     -                                     gaierror: [Errno 8] Name or service not known
+legacy True + PTR failure              ldap.example.com         10.0.0.99  True                                          1     -                                     gaierror: [Errno 8] Name or service not known
+OPTIONAL_ALL + PTR failure             ldap.example.com         10.0.0.99  (3,)                                          2     ldap@ldap.example.com                 OK
+REQUIRE_IP_ONLY + PTR failure          10.0.0.99                10.0.0.99  (2,)                                          1     -                                     gaierror: [Errno 8] Name or service not known
+OPTIONAL_IP_ONLY + PTR failure         10.0.0.99                10.0.0.99  (4,)                                          2     ldap@10.0.0.99                        OK
+IPv4 host + REQUIRE_IP_ONLY            10.0.0.10                10.0.0.10  (2,)                                          2     ldap@ldap-3.internal.example.com      OK
+IPv4 host + OPTIONAL_IP_ONLY           10.0.0.10                10.0.0.10  (4,)                                          2     ldap@ldap-3.internal.example.com      OK
+IPv4 host + OFF                        10.0.0.10                10.0.0.10  (0,)                                          0     ldap@10.0.0.10                        OK
+IPv4 host + REQUIRE_ALL                10.0.0.10                10.0.0.10  (1,)                                          2     ldap@ldap-3.internal.example.com      OK
+IPv6 host + REQUIRE_IP_ONLY            fd00::10                 fd00::10   (2,)                                          2     ldap@ldap-v6.internal.example.com     OK
+IPv6 host + OPTIONAL_IP_ONLY           fd00::10                 fd00::10   (4,)                                          2     ldap@ldap-v6.internal.example.com     OK
+IPv6 host + OFF                        fd00::10                 fd00::10   (0,)                                          0     ldap@fd00::10                         OK
+IPv6 host + REQUIRE_ALL (no PTR)       fd00::99                 fd00::99   (1,)                                          1     -                                     gaierror: [Errno 8] Name or service not known
+alias host + OPTIONAL_ALL              ldap-alias.example.com   10.0.0.11  (3,)                                          2     ldap@alias-result.internal.example.com OK
+alias host + REQUIRE_ALL               ldap-alias.example.com   10.0.0.11  (1,)                                          2     ldap@alias-result.internal.example.com OK
+alias host + OFF                       ldap-alias.example.com   10.0.0.11  (0,)                                          0     ldap@ldap-alias.example.com           OK
+alias host + string override           ldap-alias.example.com   10.0.0.11  'ldap-3.example.com'                          0     ldap@ldap-3.example.com               OK
+
+======================================================================================================================
+BACKEND: windows
+======================================================================================================================
+case                                   server.host              peer       sasl_credentials[0]                           rDNS  GSS target name                       outcome
+----------------------------------------------------------------------------------------------------------------------
+default (no credentials)               ldap.example.com         10.0.0.10  None                                          0     ldap@ldap.example.com                 OK
+explicit False (legacy OFF)            ldap.example.com         10.0.0.10  False                                         0     ldap@ldap.example.com                 OK
+explicit string override               ldap.example.com         10.0.0.10  'ldap-3.example.com'                          0     ldap@ldap-3.example.com               OK
+legacy True (require reverse)          ldap.example.com         10.0.0.10  True                                          2     ldap@ldap-3.internal.example.com      OK
+enum OFF                               ldap.example.com         10.0.0.10  (0,)                                          0     ldap@ldap.example.com                 OK
+enum REQUIRE_ALL                       ldap.example.com         10.0.0.10  (1,)                                          2     ldap@ldap-3.internal.example.com      OK
+enum REQUIRE_IP_ONLY (host=name)       ldap.example.com         10.0.0.10  (2,)                                          0     ldap@ldap.example.com                 OK
+enum OPTIONAL_ALL                      ldap.example.com         10.0.0.10  (3,)                                          2     ldap@ldap-3.internal.example.com      OK
+enum OPTIONAL_IP_ONLY (host=name)      ldap.example.com         10.0.0.10  (4,)                                          0     ldap@ldap.example.com                 OK
+raw integer 0 (OFF literal)            ldap.example.com         10.0.0.10  0                                             0     ldap@ldap.example.com                 OK
+raw integer 1 (REQUIRE_ALL literal)    ldap.example.com         10.0.0.10  1                                             0     -                                     TypeError: can only concatenate str (not "int") to str
+raw integer 3 (OPTIONAL_ALL literal)   ldap.example.com         10.0.0.10  3                                             0     -                                     TypeError: can only concatenate str (not "int") to str
+REQUIRE_ALL + PTR failure              ldap.example.com         10.0.0.99  (1,)                                          1     -                                     gaierror: [Errno 8] Name or service not known
+legacy True + PTR failure              ldap.example.com         10.0.0.99  True                                          1     -                                     gaierror: [Errno 8] Name or service not known
+OPTIONAL_ALL + PTR failure             ldap.example.com         10.0.0.99  (3,)                                          2     ldap@ldap.example.com                 OK
+REQUIRE_IP_ONLY + PTR failure          10.0.0.99                10.0.0.99  (2,)                                          1     -                                     gaierror: [Errno 8] Name or service not known
+OPTIONAL_IP_ONLY + PTR failure         10.0.0.99                10.0.0.99  (4,)                                          2     ldap@10.0.0.99                        OK
+IPv4 host + REQUIRE_IP_ONLY            10.0.0.10                10.0.0.10  (2,)                                          2     ldap@ldap-3.internal.example.com      OK
+IPv4 host + OPTIONAL_IP_ONLY           10.0.0.10                10.0.0.10  (4,)                                          2     ldap@ldap-3.internal.example.com      OK
+IPv4 host + OFF                        10.0.0.10                10.0.0.10  (0,)                                          0     ldap@10.0.0.10                        OK
+IPv4 host + REQUIRE_ALL                10.0.0.10                10.0.0.10  (1,)                                          2     ldap@ldap-3.internal.example.com      OK
+IPv6 host + REQUIRE_IP_ONLY            fd00::10                 fd00::10   (2,)                                          2     ldap@ldap-v6.internal.example.com     OK
+IPv6 host + OPTIONAL_IP_ONLY           fd00::10                 fd00::10   (4,)                                          2     ldap@ldap-v6.internal.example.com     OK
+IPv6 host + OFF                        fd00::10                 fd00::10   (0,)                                          0     ldap@fd00::10                         OK
+IPv6 host + REQUIRE_ALL (no PTR)       fd00::99                 fd00::99   (1,)                                          1     -                                     gaierror: [Errno 8] Name or service not known
+alias host + OPTIONAL_ALL              ldap-alias.example.com   10.0.0.11  (3,)                                          2     ldap@alias-result.internal.example.com OK
+alias host + REQUIRE_ALL               ldap-alias.example.com   10.0.0.11  (1,)                                          2     ldap@alias-result.internal.example.com OK
+alias host + OFF                       ldap-alias.example.com   10.0.0.11  (0,)                                          0     ldap@ldap-alias.example.com           OK
+alias host + string override           ldap-alias.example.com   10.0.0.11  'ldap-3.example.com'                          0     ldap@ldap-3.example.com               OK
+
