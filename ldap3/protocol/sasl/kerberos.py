@@ -31,6 +31,7 @@ import struct
 
 from ...core.exceptions import LDAPPackageUnavailableError, LDAPCommunicationError
 from ...core.rdns import ReverseDnsSetting, get_hostname_by_addr, is_ip_addr
+from ... import ENCRYPT
 
 posix_gssapi_unavailable = True
 try:
@@ -57,6 +58,13 @@ from .sasl import send_sasl_negotiation, abort_sasl_negotiation
 NO_SECURITY_LAYER = 1
 INTEGRITY_PROTECTION = 2
 CONFIDENTIALITY_PROTECTION = 4
+
+# RFC 4752 section 7.2.1: every protected message is prefixed with a 4 byte
+# network-order length, so the server advertised maximum output size must at
+# least cover this framing overhead.
+SASL_GSSAPI_WRAP_HEADER_SIZE = 4
+# the only security layer bits defined by RFC 4752 section 3.4
+KNOWN_SECURITY_LAYERS = NO_SECURITY_LAYER | INTEGRITY_PROTECTION | CONFIDENTIALITY_PROTECTION
 
 
 def get_channel_bindings(ssl_socket):
@@ -199,6 +207,8 @@ def _common_process_end_token_get_security_layers(negotiated_token, session_secu
     minimum security layers we need, and return a bytearray for the client security layers we want.
     This function throws an error on a malformed token from the server.
     """
+    if not isinstance(negotiated_token, (bytes, bytearray)):
+        raise LDAPCommunicationError("Incorrect response from server")
     if len(negotiated_token) != 4:
         raise LDAPCommunicationError("Incorrect response from server")
 
@@ -206,15 +216,24 @@ def _common_process_end_token_get_security_layers(negotiated_token, session_secu
     if not isinstance(server_security_layers, int):
         server_security_layers = ord(server_security_layers)
     if server_security_layers in (0, NO_SECURITY_LAYER):
-        if negotiated_token[1:] != '\x00\x00\x00':
+        if negotiated_token[1:] != b'\x00\x00\x00':
             raise LDAPCommunicationError("Server max buffer size must be 0 if no security layer")
-    security_layer = CONFIDENTIALITY_PROTECTION if session_security else NO_SECURITY_LAYER 
+    # reject masks advertising unknown security layers instead of silently ignoring them
+    if server_security_layers & ~KNOWN_SECURITY_LAYERS:
+        raise LDAPCommunicationError("Server advertised an unknown GSSAPI security layer")
+    security_layer = CONFIDENTIALITY_PROTECTION if session_security else NO_SECURITY_LAYER
     if not (server_security_layers & security_layer):
         raise LDAPCommunicationError("Server doesn't support the security level asked")
 
     max_output_size_bytes = negotiated_token[1:4]
     # We need to pod the data as struct unpack expects a 32-bit value
-    krb_wrap_size_limit = struct.unpack('!I', b'\x00' + max_output_size_bytes)[0]
+    krb_wrap_size_limit = struct.unpack('!I', b'\x00' + bytes(max_output_size_bytes))[0]
+
+    # when a confidentiality layer was requested the negotiated limit must be
+    # large enough to hold at least one wrapped message plus the RFC 4752
+    # framing header, otherwise every subsequent message would make no progress
+    if security_layer == CONFIDENTIALITY_PROTECTION and krb_wrap_size_limit <= SASL_GSSAPI_WRAP_HEADER_SIZE:
+        raise LDAPCommunicationError("Server negotiated an unusable GSSAPI maximum output size")
 
     # match the server max buffer size if we have client security layers configured
     if security_layer == CONFIDENTIALITY_PROTECTION:
@@ -222,6 +241,89 @@ def _common_process_end_token_get_security_layers(negotiated_token, session_secu
     else:
         client_security_layers = bytearray([security_layer, 0, 0, 0])
     return client_security_layers, krb_wrap_size_limit
+
+
+def _reset_krb_protection(connection):
+    """Remove any negotiated protection so a failed negotiation cannot leave a
+    context that appears usable for subsequent messages."""
+    connection.krb_ctx = None
+    connection.krb_wrap_size_limit = None
+
+
+def _check_krb_protection_available(connection):
+    """Guard the boundary between SASL negotiation and application message
+    wrapping: when encryption was requested, a usable GSSAPI context and wrap
+    limit must exist, otherwise the plaintext message is refused."""
+    if connection.session_security == ENCRYPT and (connection.krb_ctx is None or connection.krb_wrap_size_limit is None):
+        raise LDAPCommunicationError("GSSAPI encryption was negotiated but no protection context is available")
+
+
+def _posix_wrap_gssapi_message(connection, encoded_message):
+    """Wrap an LDAP message in one or more confidentiality-protected GSSAPI
+    tokens (RFC 4752 section 7). Chunk sizes are derived from the server
+    maximum output size so the 4 byte framing header and the GSSAPI wrapping
+    overhead are always accounted for and no protected frame exceeds the
+    negotiated limit."""
+    _check_krb_protection_available(connection)
+    # the negotiated limit bounds the whole on-the-wire frame, including the 4 byte length prefix
+    max_frame_size = connection.krb_wrap_size_limit - SASL_GSSAPI_WRAP_HEADER_SIZE
+    if max_frame_size <= 0:
+        raise LDAPCommunicationError("Server negotiated an unusable GSSAPI maximum output size")
+    krb_wrap_size_limit = connection.krb_ctx.get_wrap_size_limit(max_frame_size)
+    if krb_wrap_size_limit <= 0:
+        raise LDAPCommunicationError("GSSAPI wrapping overhead exceeds the negotiated maximum output size")
+
+    offset = 0
+    wrapped_messages = b''
+    while offset < len(encoded_message):
+        chunk_size = min(krb_wrap_size_limit, len(encoded_message) - offset)
+        if chunk_size <= 0:
+            raise LDAPCommunicationError("Unable to make progress wrapping the GSSAPI message")
+        message_chunk = encoded_message[offset:offset + chunk_size]
+        wrapped_message = connection.krb_ctx.wrap(message_chunk, True).message
+        if len(wrapped_message) > max_frame_size:
+            raise LDAPCommunicationError("Wrapped GSSAPI message exceeds the negotiated maximum output size")
+        wrapped_messages = wrapped_messages + struct.pack('!I', len(wrapped_message)) + wrapped_message
+        offset += chunk_size
+
+    return wrapped_messages
+
+
+def _posix_unwrap_gssapi_message(connection, protected_message):
+    _check_krb_protection_available(connection)
+    return connection.krb_ctx.unwrap(protected_message).message
+
+
+def _windows_wrap_gssapi_message(connection, encoded_message):
+    """winkerberos does not expose GSS_Wrap_size_limit, so the whole message is
+    wrapped at once and the resulting frame is checked against the server
+    maximum output size before it is allowed on the wire."""
+    import winkerberos
+    _check_krb_protection_available(connection)
+    winkerberos.authGSSClientWrap(connection.krb_ctx, base64.b64encode(encoded_message).decode('utf-8'), None, 1)
+    wrapped_message = base64.b64decode(winkerberos.authGSSClientResponse(connection.krb_ctx))
+    if len(wrapped_message) + SASL_GSSAPI_WRAP_HEADER_SIZE > connection.krb_wrap_size_limit:
+        raise LDAPCommunicationError("Wrapped GSSAPI message exceeds the negotiated maximum output size")
+    return struct.pack('!I', len(wrapped_message)) + wrapped_message
+
+
+def _windows_unwrap_gssapi_message(connection, protected_message):
+    import winkerberos
+    _check_krb_protection_available(connection)
+    winkerberos.authGSSClientUnwrap(connection.krb_ctx, base64.b64encode(protected_message).decode('utf-8'))
+    return base64.b64decode(winkerberos.authGSSClientResponse(connection.krb_ctx))
+
+
+def wrap_gssapi_message(connection, encoded_message):
+    if posix_gssapi_unavailable:
+        return _windows_wrap_gssapi_message(connection, encoded_message)
+    return _posix_wrap_gssapi_message(connection, encoded_message)
+
+
+def unwrap_gssapi_message(connection, protected_message):
+    if posix_gssapi_unavailable:
+        return _windows_unwrap_gssapi_message(connection, protected_message)
+    return _posix_unwrap_gssapi_message(connection, protected_message)
 
 
 def _posix_sasl_gssapi(connection, controls):
@@ -236,6 +338,8 @@ def _posix_sasl_gssapi(connection, controls):
                                  channel_bindings=get_channel_bindings(connection.socket))
     in_token = None
     try:
+        # never start a negotiation with a protection context left over from a previous bind
+        _reset_krb_protection(connection)
         while True:
             out_token = ctx.step(in_token)
             if out_token is None:
@@ -254,10 +358,13 @@ def _posix_sasl_gssapi(connection, controls):
         unwrapped_token = ctx.unwrap(in_token)
         client_security_layers, krb_wrap_size_limit = _common_process_end_token_get_security_layers(unwrapped_token.message, connection.session_security)
         out_token = ctx.wrap(bytes(client_security_layers)+authz_id, False)
+        result = send_sasl_negotiation(connection, controls, out_token.message)
+        # the protection context is published only once the whole negotiation succeeded
         connection.krb_ctx = ctx
         connection.krb_wrap_size_limit = krb_wrap_size_limit
-        return send_sasl_negotiation(connection, controls, out_token.message)
+        return result
     except (gssapi.exceptions.GSSError, LDAPCommunicationError):
+        _reset_krb_protection(connection)
         abort_sasl_negotiation(connection, controls)
         raise
 
@@ -280,6 +387,8 @@ def _windows_sasl_gssapi(connection, controls):
 
     in_token = b''
     try:
+        # never start a negotiation with a protection context left over from a previous bind
+        _reset_krb_protection(connection)
         negotiation_complete = False
         while not negotiation_complete:
             # GSSAPI is a "client goes first" SASL mechanism. Send the first "response" to the server and
@@ -296,7 +405,7 @@ def _windows_sasl_gssapi(connection, controls):
             in_token = result['saslCreds'] or b''
 
         winkerberos.authGSSClientUnwrap(ctx,base64.b64encode(in_token).decode('utf-8'))
-        negotiated_token = ''
+        negotiated_token = b''
         if winkerberos.authGSSClientResponse(ctx):
             negotiated_token = base64.standard_b64decode(winkerberos.authGSSClientResponse(ctx))
         client_security_layers, krb_wrap_size_limit = _common_process_end_token_get_security_layers(negotiated_token, connection.session_security)
@@ -305,9 +414,12 @@ def _windows_sasl_gssapi(connection, controls):
         authz_only_msg = base64.b64encode(bytes(client_security_layers) + authz_id).decode('utf-8')
         winkerberos.authGSSClientWrap(ctx, authz_only_msg)
         out_token = winkerberos.authGSSClientResponse(ctx) or ''
+        result = send_sasl_negotiation(connection, controls, base64.b64decode(out_token))
+        # the protection context is published only once the whole negotiation succeeded
         connection.krb_ctx = ctx
         connection.krb_wrap_size_limit = krb_wrap_size_limit
-        return send_sasl_negotiation(connection, controls, base64.b64decode(out_token))
+        return result
     except (winkerberos.GSSError, LDAPCommunicationError):
+        _reset_krb_protection(connection)
         abort_sasl_negotiation(connection, controls)
         raise
