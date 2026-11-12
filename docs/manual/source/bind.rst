@@ -327,6 +327,38 @@ This condition is checked by the ``rebind()`` method and an LDAPBindError except
 If you want an exception raised when credentials are invalid you must use the ``raise_exceptions=True`` parameter in the Connection() definition. Keep
 in mind that network errors always raise an exception, even if raise_exceptions is set to False.
 
+Identity switching with the REUSABLE strategy
+---------------------------------------------
+
+With the **REUSABLE** strategy a single Connection object drives a pool of worker connections. Switching identity
+(``bind()``/``rebind()``) is a pool-wide transaction with the following contract:
+
+* Requests already queued when the switch starts keep the identity they were submitted with. They are executed
+  before the switch is applied and their results are returned to the request that submitted them.
+* Requests submitted while the switch is in progress are not dispatched until the new identity has been confirmed.
+  A request submitted by the connection that is switching is attributed to the new identity; a request submitted
+  with any other identity is rejected rather than executed with different credentials.
+* The new identity is confirmed on one worker first and then on all remaining workers. ``rebind()`` returns True
+  (and ``bind()`` reports success) only after every worker has confirmed the new identity. Until then the previous
+  identity remains the committed one.
+* If confirmation fails, ``rebind()`` returns False and the pool enters the *failed* state. It never reports the
+  switch as successful, and it keeps the previous identity as the committed one. Requests that were deferred during
+  the failed switch are answered with the ``LDAPIdentitySwitchError`` exception on their original message ids.
+
+A pool in the *failed* state allows only these operations:
+
+* an explicit new identity switch (``rebind()``/``bind()``) that is successfully confirmed on every worker; this
+  recovers the pool and starts a new identity version;
+* ``unbind()``/``close()``, ``terminate()``, ``open()`` and read-only inspection of pool status.
+
+Ordinary operations (search, add, modify, delete, compare, modifyDn, extended) are refused with
+``LDAPIdentitySwitchError`` until a switch succeeds, and every rejection is delivered to the request that caused it.
+
+A Connection object that is not the one performing the switch keeps its own credentials. If the pool has committed a
+different identity, requests from that Connection are rejected instead of being executed under the pool identity, so
+a result produced as identity B is never delivered to a caller that is using identity A. An explicit successful
+rebind is required before that Connection can use the pool again.
+
 Extended logging
 ----------------
 To get an idea of what's happening when you perform a Simple Bind operation using the StartTLS security feature this is

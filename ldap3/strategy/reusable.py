@@ -25,13 +25,14 @@
 
 from datetime import datetime
 from os import linesep
-from threading import Thread, Lock
+from threading import Thread, Lock, RLock
 from time import sleep
 
 from .. import RESTARTABLE, get_config_parameter, AUTO_BIND_DEFAULT, AUTO_BIND_NONE, AUTO_BIND_NO_TLS, AUTO_BIND_TLS_AFTER_BIND, AUTO_BIND_TLS_BEFORE_BIND
 from .base import BaseStrategy
 from ..core.usage import ConnectionUsage
-from ..core.exceptions import LDAPConnectionPoolNameIsMandatoryError, LDAPConnectionPoolNotStartedError, LDAPOperationResult, LDAPExceptionError, LDAPResponseTimeoutError
+from ..core.exceptions import LDAPConnectionPoolNameIsMandatoryError, LDAPConnectionPoolNotStartedError, LDAPOperationResult, LDAPException, \
+    LDAPExceptionError, LDAPResponseTimeoutError, LDAPIdentitySwitchError
 from ..utils.log import log, log_enabled, ERROR, BASIC
 from ..protocol.rfc4511 import LDAP_MAX_INT
 
@@ -115,7 +116,16 @@ class ReusableStrategy(BaseStrategy):
                 self.counter = 0
                 self.terminated_usage = ConnectionUsage() if connection._usage else None
                 self.terminated = False
-                self.pool_lock = Lock()
+                self.pool_lock = RLock()  # reentrant: linearizes submission, version commit and response publication
+                self.switch_lock = RLock()  # serializes identity switches; reentrant for validate_bind -> switch_identity
+                self.identity_version = 1  # version of the identity that has been confirmed on every worker
+                self.identity_state = 'ready'  # ready | switching | failed | terminated
+                self.committed_identity = self._identity_from_connection(connection)  # identity confirmed for identity_version
+                self.pending_identity = None  # identity being confirmed while identity_state == 'switching'
+                self.pending_version = None  # identity version assigned to requests submitted during a switch
+                self.deferred_requests = []  # requests submitted during a switch, dispatched only after confirmation
+                self.terminal_rejections = dict()  # rejected message ids, kept across close/unbind cleanup
+                self.last_error = None
                 ReusableStrategy.pools[self.name] = self
                 self.started = False
                 if log_enabled(BASIC):
@@ -151,17 +161,18 @@ class ReusableStrategy(BaseStrategy):
                     else:
                         worker.get_info_from_server = False
 
-        def rebind_pool(self):
-            for worker in self.workers:
-                with worker.worker_lock:
-                    worker.connection.rebind(self.master_connection.user,
-                                             self.master_connection.password,
-                                             self.master_connection.authentication,
-                                             self.master_connection.sasl_mechanism,
-                                             self.master_connection.sasl_credentials)
+        def rebind_pool(self, connection=None, controls=None):
+            # The identity is taken from the connection that requested the
+            # switch.  Other Connection objects sharing this pool keep their
+            # own credentials; their requests are rejected until their own
+            # identity is confirmed by a successful switch, so a result can
+            # never be delivered to a caller under a different identity.
+            identity_connection = connection if connection is not None else self.master_connection
+            return self.switch_identity(self._identity_from_connection(identity_connection), controls)
 
         def start_pool(self):
             if not self.started:
+                self.identity_state = 'ready'
                 self.create_pool()
                 for worker in self.workers:
                     with worker.worker_lock:
@@ -178,18 +189,287 @@ class ReusableStrategy(BaseStrategy):
                 log(BASIC, 'created pool <%s>', self)
             self.workers = [ReusableStrategy.PooledConnectionWorker(self.master_connection, self.request_queue) for _ in range(self.pool_size)]
 
+        def _identity_from_connection(self, connection):
+            """Immutable snapshot of everything that determines the directory identity.
+
+            The version is bumped only after this identity has been confirmed by
+            every worker and reported as successful to callers.
+            """
+            return (connection.user,
+                    connection.password,
+                    connection.authentication,
+                    connection.sasl_mechanism,
+                    connection.sasl_credentials)
+
+        def _apply_identity_to_connection(self, connection, identity):
+            (connection.user, connection.password, connection.authentication,
+             connection.sasl_mechanism, connection.sasl_credentials) = identity
+
+        def switch_identity(self, identity, controls=None):
+            """Atomically move the pool from its confirmed identity to a new one.
+
+            Contract:
+            * Requests already queued keep the identity version they were
+              submitted with and are executed before the switch takes effect.
+            * Requests sent while the switch is in progress keep their own
+              identity snapshot and are held; they are executed only after the
+              new identity is confirmed, and only if the connection that
+              submitted them is the one being confirmed.  On a failed switch
+              they are answered with LDAPIdentitySwitchError instead of being
+              executed with the old or new credentials.
+            * No worker credentials are changed before the pool is idle.  A
+              confirmation bind happens on a single, dedicated worker; only
+              after it succeeds are the remaining workers rebound.  A worker
+              whose rebind fails is left out of service and the pool is
+              marked failed; the new identity is never reported as committed.
+            * The committed identity (and its version) is only updated after
+              every worker has confirmed the new identity.
+            """
+            with self.switch_lock:
+                if not self.started:
+                    raise LDAPConnectionPoolNotStartedError('connection pool not started')
+                if self.identity_state == 'terminated':
+                    raise LDAPConnectionPoolNotStartedError('connection pool terminated')
+                with self.pool_lock:
+                    self.identity_state = 'switching'
+                    self.pending_identity = identity
+                    self.pending_version = self.identity_version + 1
+                    self.last_error = None
+
+                # Wait for operations already submitted to be drained. New
+                # submissions see identity_state == 'switching' and are
+                # deferred/rejected, so this cannot wait forever.
+                self._drain_request_queue()
+
+                try:
+                    rebound = self._rebind_all_workers(identity, controls)
+                except Exception as e:
+                    self._mark_switch_failed(LDAPIdentitySwitchError('identity switch failed: ' + str(e)))
+                    return False
+                if not rebound:
+                    self._mark_switch_failed(LDAPIdentitySwitchError('identity switch failed: ' + str(self.last_error or 'unknown error')))
+                    return False
+
+                # All workers confirmed the new identity. Commit the identity
+                # and the version under pool_lock so submission cannot
+                # observe the new version before the commit or vice versa.
+                with self.pool_lock:
+                    self.committed_identity = identity
+                    self.identity_version = self.pending_version
+                    self.pending_identity = None
+                    self.pending_version = None
+                    self.identity_state = 'ready'
+                    self.bind_pool = True
+                    self._dispatch_deferred_requests()
+                return True
+
+        def _mark_switch_failed(self, exception):
+            # Mark the quarantine and answer every deferred request under one
+            # lock: no later submission can observe a 'switching' pool after
+            # this point and no deferred request can be dispatched afterwards.
+            with self.pool_lock:
+                self.identity_state = 'failed'
+                self.pending_identity = None
+                self.pending_version = None
+                self.last_error = self.last_error or str(exception)
+                self._fail_deferred_requests(exception)
+
+        def _drain_request_queue(self):
+            # request_queue.join() alone is not enough because a request may
+            # have been fetched by a worker but not yet task_done(). Wait for
+            # both the queue and all busy workers.
+            self.request_queue.join()
+            while True:
+                with self.pool_lock:
+                    busy_workers = [worker for worker in self.workers if worker.busy]
+                if not busy_workers:
+                    break
+                sleep(0.01)
+
+        def validate_identity_on_worker(self, identity, controls=None):
+            """Confirm credentials on one worker without changing pool identity.
+
+            Used by bind() when the requested identity is already the committed
+            one: the pool must still prove the credentials against the server
+            before reporting a successful bind.
+            """
+            worker = self._select_confirmation_worker()
+            if worker is None:
+                return False
+            with worker.worker_lock:
+                worker.busy = True
+                try:
+                    if not worker.connection.closed:
+                        try:
+                            worker.connection.unbind()
+                        except LDAPExceptionError:
+                            pass
+                    self._apply_identity_to_connection(worker.connection, identity)
+                    worker.connection.open(read_server_info=False)
+                    old_lazy = worker.connection.lazy
+                    worker.connection.lazy = False
+                    try:
+                        if self.tls_pool and not worker.connection.tls_started:
+                            worker.connection.start_tls(read_server_info=False)
+                        result = worker.connection.bind(read_server_info=False, controls=controls)
+                    finally:
+                        worker.connection.lazy = old_lazy
+                    return result is not False
+                finally:
+                    worker.busy = False
+
+        def _rebind_all_workers(self, identity, controls=None):
+            # Confirm the new identity on one worker first. Other workers
+            # continue to execute (already drained) work with the old identity
+            # until confirmation succeeds. If confirmation fails, no worker
+            # has changed identity, so queued/deferred requests cannot leak
+            # across identities.
+            confirmation_worker = self._select_confirmation_worker()
+            if confirmation_worker is None:
+                return False
+            try:
+                if not self._rebind_worker(confirmation_worker, identity, controls):
+                    return False
+            except LDAPException as e:
+                self.last_error = str(e)
+                return False
+
+            failed_workers = []
+            for worker in self.workers:
+                if worker is confirmation_worker:
+                    continue
+                try:
+                    if not self._rebind_worker(worker, identity, controls):
+                        failed_workers.append(worker)
+                except LDAPException as e:
+                    self.last_error = str(e)
+                    failed_workers.append(worker)
+            if failed_workers:
+                # The identity is not confirmed pool-wide; workers that were
+                # not rebound still hold the old identity, but the pool is
+                # quarantined (identity_state == 'failed') so no request can
+                # be dispatched until a later switch succeeds.
+                return False
+            return True
+
+        def _select_confirmation_worker(self):
+            # Prefer a worker that is not currently handling a request; its
+            # worker_lock serializes with any request the worker may take.
+            for worker in self.workers:
+                if not worker.busy:
+                    return worker
+            return None
+
+        def _rebind_worker(self, worker, identity, controls=None):
+            worker_id = id(worker)
+            with worker.worker_lock:
+                worker.busy = True
+                try:
+                    self._on_switch_step('before_unbind', worker_id)
+                    if not worker.connection.closed:
+                        try:
+                            worker.connection.unbind()
+                        except LDAPExceptionError:
+                            pass
+                    self._on_switch_step('before_bind', worker_id)
+                    self._apply_identity_to_connection(worker.connection, identity)
+                    worker.connection.open(read_server_info=False)
+                    old_lazy = worker.connection.lazy
+                    worker.connection.lazy = False
+                    try:
+                        if self.tls_pool and not worker.connection.tls_started:
+                            worker.connection.start_tls(read_server_info=False)
+                        result = worker.connection.bind(read_server_info=False, controls=controls)
+                    finally:
+                        worker.connection.lazy = old_lazy
+                    self._on_switch_step('after_bind', worker_id)
+                    if result is False:
+                        self.last_error = worker.connection.last_error or 'bind failed'
+                        return False
+                    return True
+                finally:
+                    worker.busy = False
+
+        def _on_switch_step(self, step, worker_id):
+            # Test hook: deterministic pause points inside the identity switch.
+            # A test can block here to inject requests and observe the contract.
+            pass
+
+        def _fail_deferred_requests(self, exception):
+            with self.pool_lock:
+                deferred, self.deferred_requests = self.deferred_requests, []
+                for counter, message_type, request, controls, version in deferred:
+                    self.terminal_rejections[counter] = (exception, None, None)
+
+        def _dispatch_deferred_requests(self):
+            # Called while switch_lock is held.  Each deferred request was
+            # validated against the identity being confirmed at submission
+            # time, so it is queued together with the version that has just
+            # been committed.  No new submission can interleave: submit_request
+            # takes pool_lock and observes identity_state == 'switching' until
+            # the caller of switch_identity commits.
+            with self.pool_lock:
+                deferred, self.deferred_requests = self.deferred_requests, []
+                for counter, message_type, request, controls, version in deferred:
+                    self.request_queue.put((counter, message_type, request, controls, version))
+
+        def submit_request(self, connection, message_type, request, controls):
+            """Allocate a counter and atomically bind the request to an identity.
+
+            The identity check, counter allocation and enqueue/defer/reject
+            decision are made under one lock so a switch cannot commit
+            between them.
+            """
+            with self.pool_lock:
+                if not self.started:
+                    raise LDAPConnectionPoolNotStartedError('connection pool not started')
+                if self.identity_state == 'terminated':
+                    raise LDAPConnectionPoolNotStartedError('connection pool terminated')
+                self.counter += 1
+                if self.counter > LDAP_MAX_INT:
+                    self.counter = 1
+                counter = self.counter
+
+                identity = self._identity_from_connection(connection)
+                if self.identity_state == 'failed':
+                    self._reject(counter, 'connection pool identity switch failed; request not executed')
+                elif self.identity_state == 'switching':
+                    if identity == self.pending_identity:
+                        # Submitted by a connection whose identity equals the
+                        # identity being confirmed: safe to run only after it
+                        # has been confirmed on every worker.
+                        self.deferred_requests.append((counter, message_type, request, controls, self.pending_version))
+                    else:
+                        self._reject(counter, 'request identity is not the identity being confirmed; request not executed')
+                elif identity != self.committed_identity:
+                    self._reject(counter, 'request identity is not the committed identity; request not executed')
+                else:
+                    self.request_queue.put((counter, message_type, request, controls, self.identity_version))
+                return counter
+
+        def _reject(self, counter, message):
+            # Publish the failure under the caller's own message id; get_response
+            # raises it for that request only.  Keep it in a terminal-rejection
+            # map so close()/unbind() cleanup cannot lose it before the caller
+            # retrieves it.
+            self.terminal_rejections[counter] = (LDAPIdentitySwitchError(message), None, None)
+
         def terminate_pool(self):
             if not self.terminated:
                 if log_enabled(BASIC):
                     log(BASIC, 'terminating pool <%s>', self)
-                self.started = False
-                self.request_queue.join()  # waits for all queue pending operations
-                for _ in range(len([worker for worker in self.workers if worker.thread.is_alive()])):  # put a TERMINATE signal on the queue for each active thread
-                    self.request_queue.put((TERMINATE_REUSABLE, None, None, None))
-                self.request_queue.join()  # waits for all queue terminate operations
-                self.terminated = True
-                if log_enabled(BASIC):
-                    log(BASIC, 'pool terminated for <%s>', self)
+                with self.switch_lock:
+                    with self.pool_lock:
+                        self.identity_state = 'terminated'
+                        self.started = False
+                    self.request_queue.join()  # waits for all queue pending operations
+                    for _ in range(len([worker for worker in self.workers if worker.thread.is_alive()])):  # put a TERMINATE signal on the queue for each active thread
+                        self.request_queue.put((TERMINATE_REUSABLE, None, None, None, None))
+                    self.request_queue.join()  # waits for all queue terminate operations
+                    self.terminated = True
+                    self._fail_deferred_requests(LDAPConnectionPoolNotStartedError('connection pool terminated'))
+                    if log_enabled(BASIC):
+                        log(BASIC, 'pool terminated for <%s>', self)
 
     class PooledConnectionThread(Thread):
         """
@@ -211,7 +491,7 @@ class ReusableStrategy(BaseStrategy):
             pool = self.master_connection.strategy.pool
             while not terminate:
                 try:
-                    counter, message_type, request, controls = pool.request_queue.get(block=True, timeout=self.master_connection.strategy.pool.keepalive)
+                    counter, message_type, request, controls, version = pool.request_queue.get(block=True, timeout=self.master_connection.strategy.pool.keepalive)
                 except Empty:  # issue an Abandon(0) operation to keep the connection live - Abandon(0) is a harmless operation
                     if not self.worker.connection.closed:
                         self.worker.connection.abandon(0)
@@ -219,62 +499,80 @@ class ReusableStrategy(BaseStrategy):
 
                 with self.worker.worker_lock:
                     self.worker.busy = True
-                    if counter == TERMINATE_REUSABLE:
-                        terminate = True
-                        if self.worker.connection.bound:
-                            try:
-                                self.worker.connection.unbind()
-                                if log_enabled(BASIC):
-                                    log(BASIC, 'thread terminated')
-                            except LDAPExceptionError:
+                    try:
+                        if counter == TERMINATE_REUSABLE:
+                            terminate = True
+                            if self.worker.connection.bound:
+                                try:
+                                    self.worker.connection.unbind()
+                                    if log_enabled(BASIC):
+                                        log(BASIC, 'thread terminated')
+                                except LDAPExceptionError:
+                                    pass
+                        elif message_type in ('bindRequest', 'unbindRequest', 'abandonRequest'):  # control operations, not tied to a caller request
+                            if message_type == 'bindRequest':
+                                try:
+                                    if self.worker.connection.closed:
+                                        self.worker.connection.open(read_server_info=False)
+                                    self.worker.connection.bind(controls=controls, read_server_info=False)
+                                except (LDAPOperationResult, LDAPExceptionError):
+                                    pass
+                            elif message_type == 'unbindRequest':
+                                try:
+                                    self.worker.connection.unbind()
+                                except LDAPExceptionError:
+                                    pass
+                            else:  # abandon cannot be executed with multiple connections
                                 pass
-                    else:
-                        if (datetime.now() - self.worker.creation_time).seconds >= self.master_connection.strategy.pool.lifetime:  # destroy and create a new connection
+                        else:
                             try:
-                                self.worker.connection.unbind()
-                            except LDAPExceptionError:
-                                pass
-                            self.worker.new_connection()
-                            if log_enabled(BASIC):
-                                log(BASIC, 'thread respawn')
-                        if message_type not in ['bindRequest', 'unbindRequest']:
-                            try:
-                                if pool.open_pool and self.worker.connection.closed:
-                                    self.worker.connection.open(read_server_info=False)
-                                    if pool.tls_pool and not self.worker.connection.tls_started:
-                                        self.worker.connection.start_tls(read_server_info=False)
-                                    if pool.bind_pool and not self.worker.connection.bound:
-                                        self.worker.connection.bind(read_server_info=False)
-                                elif pool.open_pool and not self.worker.connection.closed:  # connection already open, issues a start_tls
-                                    if pool.tls_pool and not self.worker.connection.tls_started:
-                                        self.worker.connection.start_tls(read_server_info=False)
-                                if self.worker.get_info_from_server and counter:
-                                    self.worker.connection.refresh_server_info()
-                                    self.worker.get_info_from_server = False
-                                response = None
-                                result = None
-                                if message_type == 'searchRequest':
-                                    response = self.worker.connection.post_send_search(self.worker.connection.send(message_type, request, controls))
+                                if version != pool.identity_version:  # request belongs to a superseded identity, never execute it
+                                    with pool.pool_lock:
+                                        pool._incoming[counter] = (LDAPIdentitySwitchError('stale identity version; request not executed'), None, None)
                                 else:
-                                    response = self.worker.connection.post_send_single_response(self.worker.connection.send(message_type, request, controls))
-                                result = self.worker.connection.result
-                                with pool.pool_lock:
-                                    pool._incoming[counter] = (response, result, BaseStrategy.decode_request(message_type, request, controls))
+                                    if self.worker.creation_time is not None and (datetime.now() - self.worker.creation_time).seconds >= self.master_connection.strategy.pool.lifetime:  # destroy and create a new connection
+                                        try:
+                                            self.worker.connection.unbind()
+                                        except LDAPExceptionError:
+                                            pass
+                                        self.worker.new_connection()
+                                        if log_enabled(BASIC):
+                                            log(BASIC, 'thread respawn')
+                                    if message_type not in ['bindRequest', 'unbindRequest']:
+                                        if pool.open_pool and self.worker.connection.closed:
+                                            self.worker.connection.open(read_server_info=False)
+                                            if pool.tls_pool and not self.worker.connection.tls_started:
+                                                self.worker.connection.start_tls(read_server_info=False)
+                                            if pool.bind_pool and not self.worker.connection.bound:
+                                                self.worker.connection.bind(read_server_info=False)
+                                        elif pool.open_pool and not self.worker.connection.closed:  # connection already open, issues a start_tls
+                                            if pool.tls_pool and not self.worker.connection.tls_started:
+                                                self.worker.connection.start_tls(read_server_info=False)
+                                        if self.worker.get_info_from_server and counter:
+                                            self.worker.connection.refresh_server_info()
+                                            self.worker.get_info_from_server = False
+                                        response = None
+                                        result = None
+                                        if message_type == 'searchRequest':
+                                            response = self.worker.connection.post_send_search(self.worker.connection.send(message_type, request, controls))
+                                        else:
+                                            response = self.worker.connection.post_send_single_response(self.worker.connection.send(message_type, request, controls))
+                                        result = self.worker.connection.result
+                                        with pool.pool_lock:
+                                            pool._incoming[counter] = (response, result, BaseStrategy.decode_request(message_type, request, controls))
                             except LDAPOperationResult as e:  # raise_exceptions has raised an exception. It must be redirected to the original connection thread
                                 with pool.pool_lock:
                                     pool._incoming[counter] = (e, None, None)
-                                    # pool._incoming[counter] = (type(e)(str(e)), None, None)
-                            # except LDAPOperationResult as e:  # raise_exceptions has raised an exception. It must be redirected to the original connection thread
-                            #     exc = e
-                            # with pool.pool_lock:
-                            #     if exc:
-                            #         pool._incoming[counter] = (exc, None, None)
-                            #     else:
-                            #         pool._incoming[counter] = (response, result, BaseStrategy.decode_request(message_type, request, controls))
-
-                    self.worker.busy = False
-                    pool.request_queue.task_done()
-                    self.worker.task_counter += 1
+                            except LDAPException as e:  # a communication error must not kill the response of the original request
+                                with pool.pool_lock:
+                                    pool._incoming[counter] = (e, None, None)
+                            except Exception as e:  # never strand a caller's message id
+                                with pool.pool_lock:
+                                    pool._incoming[counter] = (LDAPExceptionError(str(e)), None, None)
+                    finally:
+                        self.worker.busy = False
+                        pool.request_queue.task_done()
+                        self.worker.task_counter += 1
             if log_enabled(BASIC):
                 log(BASIC, 'thread terminated')
             if self.master_connection.usage:
@@ -312,19 +610,29 @@ class ReusableStrategy(BaseStrategy):
 
         def new_connection(self):
             from ..core.connection import Connection
+            # New workers are built from the identity the pool has confirmed,
+            # not from the master Connection object (which may be in the middle
+            # of an unconfirmed switch).
+            pool = getattr(self.master_connection.strategy, 'pool', None)
+            if pool is not None:
+                identity = pool.committed_identity
+            else:
+                identity = (self.master_connection.user, self.master_connection.password,
+                            self.master_connection.authentication, self.master_connection.sasl_mechanism,
+                            self.master_connection.sasl_credentials)
             # noinspection PyProtectedMember
             self.creation_time = datetime.now()
             self.connection = Connection(server=self.master_connection.server_pool if self.master_connection.server_pool else self.master_connection.server,
-                                         user=self.master_connection.user,
-                                         password=self.master_connection.password,
+                                         user=identity[0],
+                                         password=identity[1],
                                          auto_bind=AUTO_BIND_NONE,  # do not perform auto_bind because it reads again the schema
                                          version=self.master_connection.version,
-                                         authentication=self.master_connection.authentication,
+                                         authentication=identity[2],
                                          client_strategy=RESTARTABLE,
                                          auto_referrals=self.master_connection.auto_referrals,
                                          auto_range=self.master_connection.auto_range,
-                                         sasl_mechanism=self.master_connection.sasl_mechanism,
-                                         sasl_credentials=self.master_connection.sasl_credentials,
+                                         sasl_mechanism=identity[3],
+                                         sasl_credentials=identity[4],
                                          check_names=self.master_connection.check_names,
                                          collect_usage=self.master_connection._usage,
                                          read_only=self.master_connection.read_only,
@@ -392,6 +700,13 @@ class ReusableStrategy(BaseStrategy):
         if self.connection.usage:
             self.connection._usage.closed_sockets += 1
 
+    def _stop_listen(self):
+        # The pool owns the sockets.  Closing the master connection is a
+        # cleanup operation and must not discard queued/failed results: it
+        # leaves the pool threads alive and only marks the master closed.
+        self.connection.listening = False
+        self.connection.closed = True
+
     def send(self, message_type, request, controls=None):
         if self.pool.started:
             if message_type == 'bindRequest':
@@ -406,43 +721,40 @@ class ReusableStrategy(BaseStrategy):
                 self.pool.tls_pool = True
                 counter = BOGUS_EXTENDED
             else:
-                with self.pool.pool_lock:
-                    self.pool.counter += 1
-                    if self.pool.counter > LDAP_MAX_INT:
-                        self.pool.counter = 1
-                    counter = self.pool.counter
-                self.pool.request_queue.put((counter, message_type, request, controls))
+                # Ordinary requests are bound to the identity snapshot taken
+                # at submission time and are never executed with other
+                # credentials; the pool defers or rejects them as appropriate.
+                counter = self.pool.submit_request(self.connection, message_type, request, controls)
             return counter
         if log_enabled(ERROR):
             log(ERROR, 'reusable connection pool not started')
         raise LDAPConnectionPoolNotStartedError('reusable connection pool not started')
 
     def validate_bind(self, controls):
-        # in case of a new connection or different credentials
-        if (self.connection.user != self.pool.master_connection.user or
-                self.connection.password != self.pool.master_connection.password or
-                self.connection.authentication != self.pool.master_connection.authentication or
-                self.connection.sasl_mechanism != self.pool.master_connection.sasl_mechanism or
-                self.connection.sasl_credentials != self.pool.master_connection.sasl_credentials):
-            self.pool.master_connection.user = self.connection.user
-            self.pool.master_connection.password = self.connection.password
-            self.pool.master_connection.authentication = self.connection.authentication
-            self.pool.master_connection.sasl_mechanism = self.connection.sasl_mechanism
-            self.pool.master_connection.sasl_credentials = self.connection.sasl_credentials
-            self.pool.rebind_pool()
-        temp_connection = self.pool.workers[0].connection
-        old_lazy = temp_connection.lazy
-        temp_connection.lazy = False
-        if not self.connection.server.schema or not self.connection.server.info:
-            result = self.pool.workers[0].connection.bind(controls=controls)
-        else:
-            result = self.pool.workers[0].connection.bind(controls=controls, read_server_info=False)
-
-        temp_connection.unbind()
-        temp_connection.lazy = old_lazy
-        if result:
-            self.pool.bind_pool = True  # bind pool if bind is validated
-        return result
+        # Bind validation implements the explicit switch contract: the new
+        # identity is confirmed pool-wide before success is reported.  A
+        # failed switch leaves the pool quarantined and the caller unbound.
+        # The master Connection is only updated on behalf of the caller when
+        # it requested the switch; other Connection objects sharing the pool
+        # keep their own credentials.
+        with self.pool.switch_lock:
+            new_identity = self.pool._identity_from_connection(self.connection)
+            if new_identity != self.pool.committed_identity or self.pool.identity_state != 'ready':
+                rebound = self.pool.switch_identity(new_identity, controls)
+                if not rebound:
+                    if self.pool.last_error:
+                        self.connection.last_error = self.pool.last_error
+                    self.connection.bound = False
+                    return False
+            elif not self.pool.validate_identity_on_worker(new_identity, controls):
+                # A failed validation of the already-committed identity does
+                # not weaken the pool contract: no identity was changed.
+                self.connection.bound = False
+                return False
+            if self.connection is self.pool.master_connection:
+                self.pool._apply_identity_to_connection(self.pool.master_connection, new_identity)
+            self.connection.bound = True
+            return True
 
     def get_response(self, counter, timeout=None, get_request=False):
         sleeptime = get_config_parameter('RESPONSE_SLEEPTIME')
@@ -465,23 +777,32 @@ class ReusableStrategy(BaseStrategy):
         else:
             response = None
             result = None
-            while timeout >= 0:  # waiting for completed message to appear in _incoming
+            while timeout > 0:  # waiting for completed message to appear in _incoming
                 try:
                     with self.connection.strategy.pool.pool_lock:
                         response, result, request = self.connection.strategy.pool._incoming.pop(counter)
+                        break
                 except KeyError:
-                    sleep(sleeptime)
-                    timeout -= sleeptime
-                    continue
-                break
+                    pass
+                try:
+                    with self.connection.strategy.pool.pool_lock:
+                        response, result, request = self.connection.strategy.pool.terminal_rejections.pop(counter)
+                        break
+                except KeyError:
+                    pass
+                sleep(sleeptime)
+                timeout -= sleeptime
 
             if timeout <= 0:
                 if log_enabled(ERROR):
                     log(ERROR, 'no response from worker threads in Reusable connection')
                 raise LDAPResponseTimeoutError('no response from worker threads in Reusable connection')
 
-        if isinstance(response, LDAPOperationResult):
-            raise response  # an exception has been raised with raise_exceptions
+        if isinstance(response, Exception):
+            # Includes LDAPOperationResult from raise_exceptions and
+            # LDAPIdentitySwitchError / communication errors produced by the
+            # pool.  They are raised for the original request only.
+            raise response
 
         if get_request:
             return response, result, request

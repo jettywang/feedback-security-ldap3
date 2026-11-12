@@ -564,6 +564,19 @@ class LDAPConnectionPoolNotStartedError(LDAPExceptionError):
     pass
 
 
+class LDAPIdentitySwitchError(LDAPExceptionError):
+    """Raised when a pooled identity switch cannot be completed safely.
+
+    The pool never executes a request with an identity version other than the
+    one attached to the request.  When the pool is left in the ``failed``
+    state no ordinary operation is dispatched until an explicit successful
+    identity switch (or terminate/unbind for cleanup) is performed.
+    The exception is published under the original request's message id and
+    is raised by ``get_response`` for that request only.
+    """
+    pass
+
+
 # restartable strategy
 class LDAPMaximumRetriesError(LDAPExceptionError):
     def __str__(self):

@@ -756,8 +756,14 @@ class Connection(object):
                         log(ERROR, '%s for <%s>', self.last_error, self)
                     raise LDAPBindError(self.last_error)
             else:
-                self.strategy.pool.rebind_pool()
-                return self._prepare_return_value(True, self.result)
+                rebound = self.strategy.pool.rebind_pool(connection=self, controls=controls)
+                if not rebound:
+                    self.bound = False
+                    if not self.last_error:
+                        self.last_error = self.strategy.pool.last_error
+                else:
+                    self.bound = True
+                return self._prepare_return_value(rebound, self.result)
 
     def unbind(self,
                controls=None):
