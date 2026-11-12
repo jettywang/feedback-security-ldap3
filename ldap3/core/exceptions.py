@@ -454,6 +454,11 @@ class LDAPPasswordIsMandatoryError(LDAPExceptionError):
     pass
 
 
+class LDAPPasswordOperationError(LDAPExceptionError):
+    """Base error for explicitly requested password operations."""
+    pass
+
+
 class LDAPInvalidFilterError(LDAPExceptionError):
     pass
 

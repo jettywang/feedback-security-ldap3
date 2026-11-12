@@ -22,6 +22,15 @@ Microsoft extended operations are intended for Active Directory::
             new_password,
             old_password=None
         )
+        extend.microsoft.change_password(
+            user,
+            old_password,
+            new_password
+        )
+        extend.microsoft.reset_password(
+            user,
+            new_password
+        )
         extend.microsoft.persistent_search(
             search_base,
             search_scope,
@@ -30,6 +39,23 @@ Microsoft extended operations are intended for Active Directory::
             callback
         )
 
+
+AD password change and reset
+----------------------------
+
+AD stores passwords in the ``unicodePwd`` attribute as UTF-16LE strings enclosed in double quotes. A user changing
+their own password must send both the old and the new value, as an atomic ``DELETE`` of the old value followed by an
+``ADD`` of the new one. An administrator resetting a password sends a single ``REPLACE`` of the new value::
+
+    c = Connection(s, 'cn=admin,o=resources', 'password', auto_bind=True)
+    c.extend.microsoft.change_password('cn=user1,ou=test', old_password, new_password)  # DELETE + ADD
+    c.extend.microsoft.reset_password('cn=user1,ou=test', new_password)  # single REPLACE, privileged
+
+``change_password()`` raises ``LDAPPasswordIsMandatoryError`` if the old password is missing; an empty old password is
+still treated as a change and is sent as such. The legacy ``modify_password()`` method no longer treats a missing
+``old_password`` as a reset: it raises instead, so use ``reset_password()`` when a privileged reset is intended. Both methods return a :class:`PasswordResult` (``operation`` is
+``'change'`` or ``'reset'``); a failed operation is reported as such and is never retried as a reset. Unicode passwords
+are encoded verbatim, so a server policy rejection shows up in ``result.description`` without altering the intent.
 
 Microsoft persistent search is similar to the :doc:`standard persistent search</standard>` but not the same. It does not tell about object
 creation or deletion, it simply notifies when an object has been modified and sends all the attributes that were requested. This means it

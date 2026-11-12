@@ -45,9 +45,11 @@ from .novell.addMembersToGroups import edir_add_members_to_groups
 from .novell.removeMembersFromGroups import edir_remove_members_from_groups
 from .novell.checkGroupsMemberships import edir_check_groups_memberships
 from .standard.whoAmI import WhoAmI
-from .standard.modifyPassword import ModifyPassword
+from .standard.modifyPassword import ModifyPassword, standard_change_password, standard_reset_password
 from .standard.PagedSearch import paged_search_generator, paged_search_accumulator
 from .standard.PersistentSearch import PersistentSearch
+from .password import PasswordAdapter, PasswordResult, change_password, reset_password, \
+    PASSWORD_CHANGE, PASSWORD_RESET, PASSWORD_BACKEND_AD, PASSWORD_BACKEND_STANDARD
 
 
 class ExtendedOperationContainer(object):
@@ -73,6 +75,11 @@ class StandardExtendedOperations(ExtendedOperationContainer):
                         hash_algorithm=None,
                         salt=None,
                         controls=None):
+        # omit old_password would silently become a privileged password-set, so it is rejected;
+        # use reset_password() to perform a reset explicitly.
+        if old_password is None:
+            from ..core.exceptions import LDAPPasswordIsMandatoryError
+            raise LDAPPasswordIsMandatoryError('old password must be supplied to change a password, use reset_password() to reset it')
 
         return ModifyPassword(self._connection,
                               user,
@@ -81,6 +88,36 @@ class StandardExtendedOperations(ExtendedOperationContainer):
                               hash_algorithm,
                               salt,
                               controls).send()
+
+    def change_password(self,
+                        user,
+                        old_password,
+                        new_password=None,
+                        hash_algorithm=None,
+                        salt=None,
+                        controls=None):
+        """Explicitly change a password; the old password must be supplied."""
+        return standard_change_password(self._connection,
+                                        user=user,
+                                        old_password=old_password,
+                                        new_password=new_password,
+                                        hash_algorithm=hash_algorithm,
+                                        salt=salt,
+                                        controls=controls)
+
+    def reset_password(self,
+                       user,
+                       new_password=None,
+                       hash_algorithm=None,
+                       salt=None,
+                       controls=None):
+        """Explicitly set a password without the old one (privileged operation)."""
+        return standard_reset_password(self._connection,
+                                       user=user,
+                                       new_password=new_password,
+                                       hash_algorithm=hash_algorithm,
+                                       salt=salt,
+                                       controls=controls)
 
     def paged_search(self,
                      search_base,
@@ -296,6 +333,23 @@ class MicrosoftExtendedOperations(ExtendedOperationContainer):
                                   old_password,
                                   controls)
 
+    def change_password(self, user, old_password, new_password, controls=None):
+        """Explicitly change a user's password on AD (DELETE old + ADD new)."""
+        from .microsoft.modifyPassword import ad_change_password
+        return ad_change_password(self._connection,
+                                  user,
+                                  old_password,
+                                  new_password,
+                                  controls)
+
+    def reset_password(self, user, new_password, controls=None):
+        """Explicitly reset a user's password on AD (REPLACE, privileged)."""
+        from .microsoft.modifyPassword import ad_reset_password
+        return ad_reset_password(self._connection,
+                                 user,
+                                 new_password,
+                                 controls)
+
     def unlock_account(self, user):
         return ad_unlock_account(self._connection,
                                  user)
@@ -336,3 +390,4 @@ class ExtendedOperationsRoot(ExtendedOperationContainer):
         self.standard = StandardExtendedOperations(self._connection)
         self.novell = NovellExtendedOperations(self._connection)
         self.microsoft = MicrosoftExtendedOperations(self._connection)
+        self.password = PasswordAdapter(self._connection)

@@ -189,7 +189,7 @@ class Test(unittest.TestCase):
             # self.assertTrue('changed-password-1' in connected_user)
 
             new_password = 'Rc567812àèìòù'
-            result = self.connection.extend.microsoft.modify_password(dn, new_password)
+            result = self.connection.extend.microsoft.reset_password(dn, new_password)
             self.assertEqual(result, True)
 
             # creates a second connection and tries to bind with the new password
@@ -231,7 +231,7 @@ class Test(unittest.TestCase):
             self.delete_at_teardown.append(add_user(self.connection, testcase_id, 'pwd-3', attributes={'givenName': 'pwd-3'}))
             dn = self.delete_at_teardown[-1][0]
             new_password = 'Rc56789efgh'
-            result = self.connection.extend.microsoft.modify_password(dn, new_password)
+            result = self.connection.extend.microsoft.reset_password(dn, new_password)
             self.assertEqual(result, True)
             # creates a second connection and tries to bind with the new password
             test_connection = get_connection(bind=False, authentication=SIMPLE, simple_credentials=(dn, new_password))
