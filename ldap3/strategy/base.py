@@ -59,6 +59,7 @@ from ..core.tls import Tls
 from ..protocol.oid import Oids
 from ..protocol.rfc2696 import RealSearchControlValue
 from ..protocol.microsoft import DirSyncControlResponseValue
+from ..protocol.rfc4370 import PROXY_AUTHORIZATION_OIDS, ProxyAuthorizationValue
 from ..utils.log import log, log_enabled, ERROR, BASIC, PROTOCOL, NETWORK, EXTENDED, format_ldap_message
 from ..utils.asn1 import encode, decoder, ldap_result_to_dict_fast, decode_sequence
 from ..utils.conv import to_unicode
@@ -597,7 +598,8 @@ class BaseStrategy(object):
         """
         control_type = str(control['controlType'])
         criticality = bool(control['criticality'])
-        control_value = bytes(control['controlValue'])
+        # controlValue is OPTIONAL in the Control sequence (RFC 4511 4.1.11)
+        control_value = bytes(control['controlValue']) if control['controlValue'].hasValue() else b''
         unprocessed = None
         if control_type == '1.2.840.113556.1.4.319':  # simple paged search as per RFC2696
             control_resp, unprocessed = decoder.decode(control_value, asn1Spec=RealSearchControlValue())
@@ -613,6 +615,9 @@ class BaseStrategy(object):
             control_resp, unprocessed = decoder.decode(control_value, asn1Spec=SearchResultEntry())
             control_value = dict()
             control_value['result'] = attributes_to_dict(control_resp['attributes'])
+        elif control_type in PROXY_AUTHORIZATION_OIDS:  # Proxy Authorization Control as per RFC 4370, value is the authzId OCTET STRING
+            control_resp, unprocessed = decoder.decode(control_value, asn1Spec=ProxyAuthorizationValue())
+            control_value = to_unicode(bytes(control_resp))
         if unprocessed:
             if log_enabled(ERROR):
                 log(ERROR, 'unprocessed control response in substrate')
@@ -647,6 +652,12 @@ class BaseStrategy(object):
             control_resp = decode_sequence(control_value, 0, len(control_value))
             control_value = dict()
             control_value['result'] = attributes_to_dict_fast(control_resp[0][3][1][3])
+        elif control_type in PROXY_AUTHORIZATION_OIDS:  # Proxy Authorization Control as per RFC 4370
+            if control_value:
+                inner = decode_sequence(control_value, 0, len(control_value))  # unwrap the proxyAuthzID OCTET STRING
+                control_value = to_unicode(inner[0][3])
+            else:
+                control_value = ''
         return control_type, {'description': Oids.get(control_type, ''), 'criticality': criticality, 'value': control_value}
 
     @staticmethod

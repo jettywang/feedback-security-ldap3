@@ -45,12 +45,14 @@ from ..utils.conv import json_hook, to_unicode, to_raw
 from ..core.exceptions import LDAPDefinitionError, LDAPPasswordIsMandatoryError, LDAPInvalidValueError, LDAPSocketOpenError
 from ..core.results import RESULT_SUCCESS, RESULT_OPERATIONS_ERROR, RESULT_UNAVAILABLE_CRITICAL_EXTENSION, \
     RESULT_INVALID_CREDENTIALS, RESULT_NO_SUCH_OBJECT, RESULT_ENTRY_ALREADY_EXISTS, RESULT_COMPARE_TRUE, \
-    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN
+    RESULT_COMPARE_FALSE, RESULT_NO_SUCH_ATTRIBUTE, RESULT_UNWILLING_TO_PERFORM, RESULT_PROTOCOL_ERROR, RESULT_CONSTRAINT_VIOLATION, RESULT_NOT_ALLOWED_ON_RDN, \
+    RESULT_AUTHORIZATION_DENIED, RESULT_INSUFFICIENT_ACCESS_RIGHTS
 from ..utils.ciDict import CaseInsensitiveDict
 from ..utils.dn import to_dn, safe_dn, safe_rdn
 from ..protocol.sasl.sasl import validate_simple_password
 from ..protocol.formatters.standard import find_attribute_validator, format_attribute_values
 from ..protocol.rfc2696 import paged_search_control
+from ..protocol.rfc4370 import PROXY_AUTHORIZATION_OID, OLD_PROXIED_AUTHORIZATION_OID, PROXY_AUTHORIZATION_OIDS
 from ..utils.log import log, log_enabled, ERROR, BASIC
 from ..utils.asn1 import encode
 from ..utils.conv import ldap_escape_to_bytes
@@ -114,7 +116,9 @@ from ..protocol.convert import build_controls_list
 
 # noinspection PyProtectedMember,PyUnresolvedReferences
 
-SEARCH_CONTROLS = ['1.2.840.113556.1.4.319'  # simple paged search [RFC 2696]
+SEARCH_CONTROLS = ['1.2.840.113556.1.4.319',  # simple paged search [RFC 2696]
+                   PROXY_AUTHORIZATION_OID,  # proxy authorization [RFC 4370]
+                   OLD_PROXIED_AUTHORIZATION_OID,  # proxied authorization [Netscape draft]
                    ]
 SERVER_ENCODING = 'utf-8'
 
@@ -169,6 +173,12 @@ class MockBaseStrategy(object):
         self.operational_attributes = ['entryDN']
         self.add_entry('cn=schema', [], validate=False)  # add default entry for schema
         self._paged_sets = []  # list of paged search in progress
+        # proxy authorization policy of the mock DSA, see _check_proxy_authorization:
+        #   None  -> the DSA understands the proxy authorization control and accepts every authzId
+        #   set() -> only the authzIds in the set may be impersonated by the bound account
+        self.proxy_authorization_allowed = None
+        # last authorization id actually enforced on a completed search, for test assertions
+        self.last_proxy_authorization_id = None
         if log_enabled(BASIC):
             log(BASIC, 'instantiated <%s>: <%s>', self.__class__.__name__, self)
 
@@ -619,48 +629,98 @@ class MockBaseStrategy(object):
         # response_entry: object, attributes
         # response_done: LDAPResult
         request = search_request_to_dict(request_message)
-        if controls:
-            decoded_controls = [self.decode_control(control) for control in controls if control]
-            for decoded_control in decoded_controls:
-                if decoded_control[1]['criticality'] and decoded_control[0] not in SEARCH_CONTROLS:
-                    message = 'Critical requested control ' + str(decoded_control[0]) + ' not available'
-                    result = {'resultCode': RESULT_UNAVAILABLE_CRITICAL_EXTENSION,
-                              'matchedDN': '',
-                              'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
-                              'referral': None
-                              }
-                    return [], result
-                elif decoded_control[0] == '1.2.840.113556.1.4.319':  # Simple paged search
-                    if not decoded_control[1]['value']['cookie']:  # new paged search
-                        response, result =  self._execute_search(request)
-                        if result['resultCode'] == RESULT_SUCCESS:  # success
-                            paged_set = PagedSearchSet(response, int(decoded_control[1]['value']['size']), decoded_control[1]['criticality'])
-                            response, result = paged_set.next()
-                            if paged_set.done:  # paged search already completed, no need to store the set
-                                del paged_set
-                            else:
-                                self._paged_sets.append(paged_set)
-                            return response, result
-                        else:
-                            return [], result
-                    else:
-                        for paged_set in self._paged_sets:
-                            if paged_set.cookie == decoded_control[1]['value']['cookie']: # existing paged set
-                                response, result = paged_set.next()  # returns next bunch of entries as per paged set specifications
-                                if paged_set.done:
-                                    self._paged_sets.remove(paged_set)
-                                return response, result
-                        # paged set not found
-                        message = 'Invalid cookie in simple paged search'
-                        result = {'resultCode': RESULT_OPERATIONS_ERROR,
-                                  'matchedDN': '',
-                                  'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
-                                  'referral': None
-                                  }
-                        return [], result
-
-        else:
+        self.last_proxy_authorization_id = None
+        if not controls:
             return self._execute_search(request)
+
+        decoded_controls = [self.decode_control(control) for control in controls if control]
+        proxy_control = None
+        for decoded_control in decoded_controls:
+            control_type = decoded_control[0]
+            criticality = decoded_control[1]['criticality']
+            if control_type in PROXY_AUTHORIZATION_OIDS:
+                proxy_control = decoded_control
+            elif criticality and control_type not in SEARCH_CONTROLS:
+                # a critical control the mock DSA does not implement must fail the whole
+                # request (RFC 4511 4.1.11); unknown controls are never silently accepted
+                message = 'Critical requested control ' + str(control_type) + ' not available'
+                result = {'resultCode': RESULT_UNAVAILABLE_CRITICAL_EXTENSION,
+                          'matchedDN': '',
+                          'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                          'referral': None
+                          }
+                return [], result
+
+        if proxy_control is not None:
+            proxy_result = self._check_proxy_authorization(proxy_control)
+            if proxy_result is not None:
+                return [], proxy_result
+            self.last_proxy_authorization_id = proxy_control[1]['value']
+
+        for decoded_control in decoded_controls:
+            if decoded_control[0] == '1.2.840.113556.1.4.319':  # Simple paged search
+                if not decoded_control[1]['value']['cookie']:  # new paged search
+                    response, result = self._execute_search(request)
+                    if result['resultCode'] == RESULT_SUCCESS:  # success
+                        paged_set = PagedSearchSet(response, int(decoded_control[1]['value']['size']), decoded_control[1]['criticality'])
+                        response, result = paged_set.next()
+                        if paged_set.done:  # paged search already completed, no need to store the set
+                            del paged_set
+                        else:
+                            self._paged_sets.append(paged_set)
+                        return response, result
+                    return [], result
+                for paged_set in self._paged_sets:
+                    if paged_set.cookie == decoded_control[1]['value']['cookie']:  # existing paged set
+                        response, result = paged_set.next()  # returns next bunch of entries as per paged set specifications
+                        if paged_set.done:
+                            self._paged_sets.remove(paged_set)
+                        return response, result
+                # paged set not found
+                message = 'Invalid cookie in simple paged search'
+                result = {'resultCode': RESULT_OPERATIONS_ERROR,
+                          'matchedDN': '',
+                          'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                          'referral': None
+                          }
+                return [], result
+
+        return self._execute_search(request)
+
+    def _check_proxy_authorization(self, proxy_control):
+        """Enforce RFC 4370 proxy authorization in the mock DSA.
+
+        Returns an LDAPResult dict when the proxy request must be rejected,
+        or None when the authorization id is accepted and the search may run
+        under that identity. A non-critical proxy control is still enforced:
+        the mock DSA never lets an unknown or denied identity fall back to the
+        bound service account.
+        """
+        control_type, control_data = proxy_control
+        criticality = control_data['criticality']
+        authz_id = control_data['value']
+        if not authz_id:
+            message = 'proxy authorization control carries an empty authorization id'
+            return {'resultCode': RESULT_PROTOCOL_ERROR if not criticality else RESULT_UNAVAILABLE_CRITICAL_EXTENSION,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                    'referral': None
+                    }
+        # proxy_authorization_allowed is None: every known authzId is accepted.
+        # Otherwise it is the set of authzIds the bound account may impersonate.
+        if self.proxy_authorization_allowed is not None and authz_id not in self.proxy_authorization_allowed:
+            message = 'bound account is not allowed to act as ' + authz_id
+            result_code = RESULT_AUTHORIZATION_DENIED
+            if authz_id.startswith('dn:') and authz_id[3:] not in self.entries:
+                # RFC 4370 section 3: an unknown DN authzId may be reported as insufficientAccessRights
+                result_code = RESULT_INSUFFICIENT_ACCESS_RIGHTS
+                message = 'authorization id ' + authz_id + ' is unknown or not accessible'
+            return {'resultCode': result_code,
+                    'matchedDN': '',
+                    'diagnosticMessage': to_unicode(message, SERVER_ENCODING),
+                    'referral': None
+                    }
+        return None
 
     def _execute_search(self, request):
         responses = []

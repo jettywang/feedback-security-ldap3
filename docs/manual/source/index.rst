@@ -59,6 +59,7 @@ Contents
    metrics
    operations
    extend
+   proxyAuthorization
    encoding
    abstraction
    ldif
