@@ -1277,6 +1277,11 @@ class Connection(object):
                     if log_enabled(PROTOCOL):
                         log(PROTOCOL, 'ABANDON request: <%s> sent via <%s>', abandon_request_to_dict(request), self)
                     self.send('abandonRequest', request, controls)
+                    if message_id != 0 and hasattr(self.strategy, 'abandon_message'):
+                        # the Abandon has no server acknowledgement: only the wire send completed.
+                        # Quarantine the id now so entries already buffered and any late entry/done
+                        # arriving afterwards can never reach the cancelled caller or a future caller
+                        self.strategy.abandon_message(message_id)
                     self.result = None
                     self.response = None
                     self._entries = []

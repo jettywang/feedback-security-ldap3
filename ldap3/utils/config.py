@@ -79,6 +79,7 @@ _POOLING_LOOP_TIMEOUT = 10  # number of seconds to wait before restarting a cycl
 _RESPONSE_SLEEPTIME = 0.05  # seconds to wait while waiting for a response in asynchronous strategies
 _RESPONSE_WAITING_TIMEOUT = 20  # waiting timeout for receiving a response in asynchronous strategies
 _SOCKET_SIZE = 4096  # socket byte size
+_ABANDONED_MESSAGE_RETENTION = 1024  # max number of abandoned message ids kept in the quarantine of an asynchronous connection, oldest entries are evicted once the limit is exceeded
 _CHECK_AVAILABILITY_TIMEOUT = 2.5  # default timeout for socket connect when checking availability
 _RESET_AVAILABILITY_TIMEOUT = 5  # default timeout for resetting the availability status when checking candidate addresses
 _RESTARTABLE_SLEEPTIME = 2  # time to wait in a restartable strategy before retrying the request
@@ -107,6 +108,7 @@ PARAMETERS = ['CASE_INSENSITIVE_ATTRIBUTE_NAMES',
               'RESPONSE_SLEEPTIME',
               'RESPONSE_WAITING_TIMEOUT',
               'SOCKET_SIZE',
+              'ABANDONED_MESSAGE_RETENTION',
               'CHECK_AVAILABILITY_TIMEOUT',
               'RESTARTABLE_SLEEPTIME',
               'RESTARTABLE_TRIES',
@@ -145,6 +147,8 @@ def get_config_parameter(parameter):
         return _RESPONSE_WAITING_TIMEOUT
     elif parameter == 'SOCKET_SIZE':  # Integer
         return _SOCKET_SIZE
+    elif parameter == 'ABANDONED_MESSAGE_RETENTION':  # Integer
+        return _ABANDONED_MESSAGE_RETENTION
     elif parameter == 'CHECK_AVAILABILITY_TIMEOUT':  # Integer
         return _CHECK_AVAILABILITY_TIMEOUT
     elif parameter == 'RESTARTABLE_SLEEPTIME':  # Integer
@@ -235,6 +239,9 @@ def set_config_parameter(parameter, value):
     elif parameter == 'SOCKET_SIZE':
         global _SOCKET_SIZE
         _SOCKET_SIZE = value
+    elif parameter == 'ABANDONED_MESSAGE_RETENTION':
+        global _ABANDONED_MESSAGE_RETENTION
+        _ABANDONED_MESSAGE_RETENTION = value
     elif parameter == 'CHECK_AVAILABILITY_TIMEOUT':
         global _CHECK_AVAILABILITY_TIMEOUT
         _CHECK_AVAILABILITY_TIMEOUT = value

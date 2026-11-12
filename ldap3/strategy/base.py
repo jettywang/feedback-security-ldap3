@@ -321,6 +321,17 @@ class BaseStrategy(object):
     def _stop_listen(self):
         self.connection.listening = False
 
+    def _reserve_message_id(self, message_id):
+        """
+        Hook called by send() right after a message id is allocated and before
+        the request is encoded.
+
+        Synchronous strategies have no receiver thread or response quarantine,
+        so the default is a no-op. The asynchronous strategy overrides it to
+        enforce its abandon/message-id reuse safety boundary.
+        """
+        pass
+
     def send(self, message_type, request, controls=None):
         """
         Send an LDAP message
@@ -334,6 +345,10 @@ class BaseStrategy(object):
                     log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
                 raise LDAPSASLBindInProgressError(self.connection.last_error)
             message_id = self.connection.server.next_message_id()
+            # asynchronous strategies validate the id against their abandon
+            # quarantine here, before any byte hits the wire; synchronous
+            # strategies keep the default no-op
+            self._reserve_message_id(message_id)
             ldap_message = LDAPMessage()
             ldap_message['messageID'] = MessageID(message_id)
             ldap_message['protocolOp'] = ProtocolOp().setComponentByName(message_type, request)

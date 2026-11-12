@@ -1,3 +1,6 @@
+# unreleased
+    - ASYNC strategy: isolate late responses of abandoned requests so stale entries/results can never reach the cancelled caller or a later request; quarantined message ids cannot be reused on the same socket (new LDAPOperationAbandonedError and LDAPMessageIDReuseError exceptions, ABANDONED_MESSAGE_RETENTION config parameter)
+
 # 2.10.2rc4 . 2026.04.18
     - fixed IndexError in auto_range search when response has no ranged attributes
     - fixed TypeError in format_ad_timedelta with malformed AD timestamps

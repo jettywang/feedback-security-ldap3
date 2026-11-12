@@ -510,6 +510,16 @@ class LDAPResponseTimeoutError(LDAPExceptionError):
     pass
 
 
+class LDAPOperationAbandonedError(LDAPExceptionError):
+    """Raised when get_response() is called for a message id that was locally abandoned.
+
+    An Abandon request has no server acknowledgement, so this only means the
+    Abandon was sent; late responses for the same message id are quarantined
+    and can never wake the abandoned caller.
+    """
+    pass
+
+
 class LDAPTransactionError(LDAPExceptionError):
     pass
 
@@ -540,6 +550,19 @@ class LDAPSocketSendError(LDAPCommunicationError, socket.error):
 
 
 class LDAPSessionTerminatedByServerError(LDAPCommunicationError):
+    pass
+
+
+class LDAPMessageIDReuseError(LDAPCommunicationError):
+    """Raised when a new request would reuse a message id still quarantined
+    because a previous request using it was abandoned.
+
+    The LDAP message id space is shared by every outstanding request on the
+    connection and late responses only carry the message id, so reusing a
+    quarantined id on the same socket would let stale responses reach the new
+    caller. Rebind the connection (a new TCP session resets the message id
+    space) before sending further requests.
+    """
     pass
 
 
