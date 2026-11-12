@@ -1,0 +1,7 @@
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+pyasn1==0.6.5
+pycryptodomex==3.24.2
+pygments==2.21.0
+pytest==9.2.0
