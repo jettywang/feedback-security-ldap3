@@ -47,7 +47,7 @@ from ..operation.modify import modify_operation, modify_request_to_dict
 from ..operation.modifyDn import modify_dn_operation, modify_dn_request_to_dict
 from ..operation.search import search_operation, search_request_to_dict
 from ..protocol.rfc2849 import operation_to_ldif, add_ldif_header
-from ..protocol.sasl.digestMd5 import sasl_digest_md5
+from ..protocol.sasl.digestMd5 import sasl_digest_md5, HANDSHAKE_NOT_STARTED
 from ..protocol.sasl.external import sasl_external
 from ..protocol.sasl.plain import sasl_plain
 from ..strategy.sync import SyncStrategy
@@ -297,6 +297,7 @@ class Connection(object):
             self._digest_md5_kcc_cipher = None
             self._digest_md5_kcs_cipher = None
             self._digest_md5_sec_num = 0
+            self._digest_md5_handshake_state = HANDSHAKE_NOT_STARTED
             self.krb_ctx = None
             self.krb_wrap_size_limit = None
 
