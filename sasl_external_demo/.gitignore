@@ -1,0 +1,5 @@
+# Generated PKI material and private keys (run make_certs.sh to recreate)
+pki/
+# Python caches
+__pycache__/
+*.pyc
