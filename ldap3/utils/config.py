@@ -92,6 +92,8 @@ _ADDITIONAL_CLIENT_ENCODINGS = ['utf-8']
 _IGNORE_MALFORMED_SCHEMA = False  # some flaky LDAP servers returns malformed schema. If True no expection is raised and schema is thrown away
 _DEFAULT_SERVER_ENCODING = 'utf-8'  # should always be utf-8
 _LDIF_LINE_LENGTH = 78  # as stated in RFC 2849
+_MAX_MESSAGE_SIZE = None  # maximum allowed size in bytes of a single received LDAP message, None means no limit
+_MAX_PENDING_BUFFER = None  # maximum allowed size in bytes of the not-yet-complete received data buffered per connection, None means no limit
 
 if stdin and hasattr(stdin, 'encoding') and stdin.encoding:
     _DEFAULT_CLIENT_ENCODING = stdin.encoding
@@ -126,7 +128,9 @@ PARAMETERS = ['CASE_INSENSITIVE_ATTRIBUTE_NAMES',
               'IGNORE_MALFORMED_SCHEMA',
               'ATTRIBUTES_EXCLUDED_FROM_OBJECT_DEF',
               'IGNORED_MANDATORY_ATTRIBUTES_IN_OBJECT_DEF',
-              'LDIF_LINE_LENGTH'
+              'LDIF_LINE_LENGTH',
+              'MAX_MESSAGE_SIZE',
+              'MAX_PENDING_BUFFER'
               ]
 
 
@@ -209,6 +213,10 @@ def get_config_parameter(parameter):
             return [_IGNORED_MANDATORY_ATTRIBUTES_IN_OBJECT_DEF]
     elif parameter == 'LDIF_LINE_LENGTH':  # Integer
         return _LDIF_LINE_LENGTH
+    elif parameter == 'MAX_MESSAGE_SIZE':  # Integer or None
+        return _MAX_MESSAGE_SIZE
+    elif parameter == 'MAX_PENDING_BUFFER':  # Integer or None
+        return _MAX_PENDING_BUFFER
 
     raise LDAPConfigurationParameterError('configuration parameter %s not valid' % parameter)
 
@@ -295,5 +303,11 @@ def set_config_parameter(parameter, value):
     elif parameter == 'LDIF_LINE_LENGTH':
         global _LDIF_LINE_LENGTH
         _LDIF_LINE_LENGTH = value
+    elif parameter == 'MAX_MESSAGE_SIZE':
+        global _MAX_MESSAGE_SIZE
+        _MAX_MESSAGE_SIZE = value
+    elif parameter == 'MAX_PENDING_BUFFER':
+        global _MAX_PENDING_BUFFER
+        _MAX_PENDING_BUFFER = value
     else:
         raise LDAPConfigurationParameterError('unable to set configuration parameter %s' % parameter)

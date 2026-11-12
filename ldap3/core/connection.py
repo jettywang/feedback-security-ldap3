@@ -219,7 +219,9 @@ class Connection(object):
                  pool_keepalive=None,
                  source_address=None,
                  source_port=None,
-                 source_port_list=None):
+                 source_port_list=None,
+                 max_message_size=None,
+                 max_pending_buffer=None):
 
         conf_default_pool_name = get_config_parameter('DEFAULT_THREADED_POOL_NAME')
         self.connection_lock = RLock()  # re-entrant lock to ensure that operations in the Connection object are executed atomically in the same thread
@@ -288,6 +290,22 @@ class Connection(object):
             self._entries = []
             self.fast_decoder = fast_decoder
             self.receive_timeout = receive_timeout
+            if max_message_size is None:
+                max_message_size = get_config_parameter('MAX_MESSAGE_SIZE')
+            if max_pending_buffer is None:
+                max_pending_buffer = get_config_parameter('MAX_PENDING_BUFFER')
+            if max_message_size is not None and (not isinstance(max_message_size, int) or max_message_size < 0):
+                self.last_error = 'max_message_size must be a non-negative integer or None'
+                if log_enabled(ERROR):
+                    log(ERROR, '%s for <%s>', self.last_error, self)
+                raise LDAPInvalidValueError(self.last_error)
+            if max_pending_buffer is not None and (not isinstance(max_pending_buffer, int) or max_pending_buffer < 0):
+                self.last_error = 'max_pending_buffer must be a non-negative integer or None'
+                if log_enabled(ERROR):
+                    log(ERROR, '%s for <%s>', self.last_error, self)
+                raise LDAPInvalidValueError(self.last_error)
+            self.max_message_size = max_message_size
+            self.max_pending_buffer = max_pending_buffer
             self.empty_attributes = return_empty_attributes
             self.use_referral_cache = use_referral_cache
             self.auto_escape = auto_escape

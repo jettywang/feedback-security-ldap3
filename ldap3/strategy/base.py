@@ -38,7 +38,7 @@ from .. import SYNC, ANONYMOUS, get_config_parameter, BASE, ALL_ATTRIBUTES, ALL_
 from ..core.results import DO_NOT_RAISE_EXCEPTIONS, RESULT_REFERRAL
 from ..core.exceptions import LDAPOperationResult, LDAPSASLBindInProgressError, LDAPSocketOpenError, LDAPSessionTerminatedByServerError,\
     LDAPUnknownResponseError, LDAPUnknownRequestError, LDAPReferralError, communication_exception_factory, LDAPStartTLSError, \
-    LDAPSocketSendError, LDAPExceptionError, LDAPControlError, LDAPResponseTimeoutError, LDAPTransactionError
+    LDAPSocketSendError, LDAPExceptionError, LDAPControlError, LDAPResponseTimeoutError, LDAPTransactionError, LDAPMessageSizeLimitError
 from ..utils.uri import parse_uri
 from ..protocol.rfc4511 import LDAPMessage, ProtocolOp, MessageID, SearchResultEntry
 from ..operation.add import add_response_to_dict, add_request_to_dict
@@ -68,6 +68,8 @@ from ..protocol.sasl.kerberos import posix_gssapi_unavailable
 SESSION_TERMINATED_BY_SERVER = 'TERMINATED_BY_SERVER'
 TRANSACTION_ERROR = 'TRANSACTION_ERROR'
 RESPONSE_COMPLETE = 'RESPONSE_FROM_SERVER_COMPLETE'
+
+MAX_BER_LENGTH_OCTETS = 4  # maximum number of octets allowed in a BER definite-length header, longer encodings are rejected
 
 
 # noinspection PyProtectedMember
@@ -365,6 +367,9 @@ class BaseStrategy(object):
         response = None
         result = None
         # request = None
+        receiver_exception = getattr(self, '_receiver_exception', None)  # set by asynchronous strategies when the receiver thread terminates the connection
+        if receiver_exception is not None:
+            raise receiver_exception
         if self._outstanding and message_id in self._outstanding:
             responses = self._get_response(message_id, timeout)
 
@@ -493,6 +498,56 @@ class BaseStrategy(object):
                     ret_value = value_length + 2 + bytes_length
 
         return ret_value
+
+    def _check_declared_message_size(self, declared_size):
+        """
+        Check a message size declared by the server (BER definite length or SASL buffer length)
+        against the per-connection max_message_size limit. Raises LDAPMessageSizeLimitError when
+        the declared size exceeds the limit, before the whole message is received.
+        """
+        max_message_size = self.connection.max_message_size
+        if max_message_size is not None and declared_size > max_message_size:
+            if log_enabled(ERROR):
+                log(ERROR, 'declared message size %d exceeds maximum %d for <%s>', declared_size, max_message_size, self.connection)
+            raise LDAPMessageSizeLimitError('declared message size %d exceeds maximum of %d bytes' % (declared_size, max_message_size))
+
+    def _check_pending_buffer_size(self, pending_size):
+        """
+        Check the amount of not-yet-complete received data buffered for this connection against
+        the per-connection max_pending_buffer limit. Raises LDAPMessageSizeLimitError when the
+        buffered data exceeds the limit.
+        """
+        max_pending_buffer = self.connection.max_pending_buffer
+        if max_pending_buffer is not None and pending_size > max_pending_buffer:
+            if log_enabled(ERROR):
+                log(ERROR, 'pending receive buffer %d exceeds maximum %d for <%s>', pending_size, max_pending_buffer, self.connection)
+            raise LDAPMessageSizeLimitError('pending receive buffer of %d bytes exceeds maximum of %d bytes' % (pending_size, max_pending_buffer))
+
+    def _checked_ldap_message_size(self, buffered):
+        """
+        Compute the size of the LDAP message at the beginning of buffered, enforcing the
+        per-connection receive limits before the whole message is available.
+        Returns -1 when too few data to compute the message length, as compute_ldap_message_size.
+        Raises LDAPMessageSizeLimitError when the BER length header is malformed (more than
+        MAX_BER_LENGTH_OCTETS length octets), when the declared message size exceeds
+        max_message_size, or when the incomplete buffered data exceeds max_pending_buffer.
+        """
+        if isinstance(buffered, str):  # fix for Python 2, data is string not bytes
+            buffered = bytearray(buffered)  # Python 2 bytearray is equivalent to Python 3 bytes
+
+        if len(buffered) >= 2 and buffered[1] > 128 + MAX_BER_LENGTH_OCTETS:  # long form with too many length octets
+            if log_enabled(ERROR):
+                log(ERROR, 'invalid BER length header with %d length octets for <%s>', buffered[1] - 128, self.connection)
+            raise LDAPMessageSizeLimitError('invalid BER length header with %d length octets' % (buffered[1] - 128))
+
+        length = BaseStrategy.compute_ldap_message_size(buffered)
+        if length == -1:  # too few data to decode message length
+            self._check_pending_buffer_size(len(buffered))
+            return -1
+        self._check_declared_message_size(length)
+        if len(buffered) < length:  # message not completely received yet
+            self._check_pending_buffer_size(len(buffered))
+        return length
 
     def decode_response(self, ldap_message):
         """

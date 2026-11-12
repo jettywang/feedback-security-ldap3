@@ -27,7 +27,7 @@ from threading import Thread, Lock, Event
 import socket
 
 from .. import get_config_parameter, DIGEST_MD5, ENCRYPT
-from ..core.exceptions import LDAPSSLConfigurationError, LDAPStartTLSError, LDAPOperationResult, LDAPSignatureVerificationFailedError, LDAPConfigurationError
+from ..core.exceptions import LDAPSSLConfigurationError, LDAPStartTLSError, LDAPOperationResult, LDAPSignatureVerificationFailedError, LDAPConfigurationError, LDAPMessageSizeLimitError
 from ..strategy.base import BaseStrategy, RESPONSE_COMPLETE
 from ..protocol.rfc4511 import LDAPMessage
 from ..utils.log import log, log_enabled, format_ldap_message, ERROR, NETWORK, EXTENDED
@@ -74,113 +74,135 @@ class AsyncStrategy(BaseStrategy):
             # sasl_signature = b''  # not needed here GC
             # sasl_sec_num = b'' # used to verify the signature, not needed here GC
 
-            while listen:
-                if get_more_data:
-                    try:
-                        data = self.connection.socket.recv(self.socket_size)
-                    except (OSError, socket.error, AttributeError):
-                        if self.connection.receive_timeout:  # a receive timeout has been detected - keep kistening on the socket
-                            continue
-                    except Exception as e:
-                        if log_enabled(ERROR):
-                            log(ERROR, '<%s> for <%s>', str(e), self.connection)
-                        raise  # unexpected exception - re-raise
-                    if len(data) > 0:
-                        # If we are using DIGEST-MD5 and LDAP signing is set : verify & remove the signature from the message
-                        if self.connection._digest_md5_kcs_cipher or self.connection.session_security == ENCRYPT:
-                            raise LDAPConfigurationError("Confidentiality layers are only available for synchronous strategies")
-                        if self.connection.sasl_mechanism == DIGEST_MD5 and self.connection._digest_md5_kis and not self.connection.sasl_in_progress:
-                            data = sasl_next_packet + data
-
-                            if sasl_received_data == b'' or sasl_next_packet:
-                                # Remove the sizeOf(encoded_message + signature + 0x0001 + secNum) from data.
-                                sasl_buffer_length = int.from_bytes(data[0:4], "big")
-                                data = data[4:]
-                            sasl_next_packet = b''
-                            sasl_total_bytes_recieved += len(data)
-                            sasl_received_data += data
-
-                            if sasl_total_bytes_recieved >= sasl_buffer_length:
-                                # When the LDAP response is splitted accross multiple TCP packets, the SASL buffer length is equal to the MTU of each packet..Which is usually not equal to self.socket_size
-                                # This means that the end of one SASL packet/beginning of one other....could be located in the middle of data
-                                # We are using "sasl_received_data" instead of "data" & "unprocessed" for this reason
-                                sasl_next_packet = sasl_received_data[sasl_buffer_length:]  # the last "data" variable may contain another sasl packet. We'll process it at the next iteration.
-
-                                # structure of messages when LDAP signing is enabled : sizeOf(encoded_message + signature + 0x0001 + secNum) + encoded_message + signature + 0x0001 + secNum
-                                sasl_sec_num = sasl_received_data[sasl_buffer_length - 4:sasl_buffer_length]
-                                sasl_received_data = sasl_received_data[:sasl_buffer_length-6] # Removing secNum and the message type number to fit also encryption
-                                sasl_buffer_length = len(sasl_received_data) # We can do that because len(ciphertext) == len(plaintext) for RC4
-                                sasl_signature = sasl_received_data[sasl_buffer_length - 10:]
-                                sasl_received_data = sasl_received_data[:sasl_buffer_length - 10]  # retrieve encoded_message
-                                kis = self.connection._digest_md5_kis  # renamed to lowercase GC
-                                calculated_signature = bytes.fromhex(md5_hmac(kis, sasl_sec_num + sasl_received_data)[0:20])
-                                if sasl_signature != calculated_signature:
-                                    raise LDAPSignatureVerificationFailedError("Signature verification failed for the recieved LDAP message number " + str(int.from_bytes(sasl_sec_num, 'big')) + ". Expected signature " + calculated_signature.hex() + " but got " + sasl_signature.hex() + ".")
-                                sasl_total_bytes_recieved = 0
-                                unprocessed += sasl_received_data
-                                sasl_received_data = b''
+            try:
+                while listen:
+                    if get_more_data:
+                        if sasl_next_packet:  # a buffered SASL packet is waiting to be processed, don't read more data from the socket
+                            data = b''
                         else:
-                            unprocessed += data
-                        data = b''
-                    else:
-                        listen = False
-                length = BaseStrategy.compute_ldap_message_size(unprocessed)
-                if length == -1 or len(unprocessed) < length:
-                    get_more_data = True
-                elif len(unprocessed) >= length:  # add message to message list
-                    if self.connection.usage:
-                        self.connection._usage.update_received_message(length)
-                        if log_enabled(NETWORK):
-                            log(NETWORK, 'received %d bytes via <%s>', length, self.connection)
-                    if self.connection.fast_decoder:
-                        ldap_resp = decode_message_fast(unprocessed[:length])
-                        dict_response = self.connection.strategy.decode_response_fast(ldap_resp)
-                    else:
-                        ldap_resp = decoder.decode(unprocessed[:length], asn1Spec=LDAPMessage())[0]
-                        dict_response = self.connection.strategy.decode_response(ldap_resp)
-                    message_id = int(ldap_resp['messageID'])
-                    if log_enabled(NETWORK):
-                        log(NETWORK, 'received 1 ldap message via <%s>', self.connection)
-                    if log_enabled(EXTENDED):
-                        log(EXTENDED, 'ldap message received via <%s>:%s', self.connection, format_ldap_message(ldap_resp, '<<'))
-                    if dict_response['type'] == 'extendedResp' and (dict_response['responseName'] == '1.3.6.1.4.1.1466.20037' or hasattr(self.connection, '_awaiting_for_async_start_tls')):
-                        if dict_response['result'] == 0:  # StartTls in progress
-                            if self.connection.server.tls:
-                                self.connection.server.tls._start_tls(self.connection)
+                            try:
+                                data = self.connection.socket.recv(self.socket_size)
+                            except (OSError, socket.error, AttributeError):
+                                if self.connection.receive_timeout:  # a receive timeout has been detected - keep kistening on the socket
+                                    continue
+                            except Exception as e:
+                                if log_enabled(ERROR):
+                                    log(ERROR, '<%s> for <%s>', str(e), self.connection)
+                                raise  # unexpected exception - re-raise
+                        if len(data) > 0 or sasl_next_packet:
+                            # If we are using DIGEST-MD5 and LDAP signing is set : verify & remove the signature from the message
+                            if self.connection._digest_md5_kcs_cipher or self.connection.session_security == ENCRYPT:
+                                raise LDAPConfigurationError("Confidentiality layers are only available for synchronous strategies")
+                            if self.connection.sasl_mechanism == DIGEST_MD5 and self.connection._digest_md5_kis and not self.connection.sasl_in_progress:
+                                data = sasl_next_packet + data
+                                sasl_next_packet = b''
+                                sasl_received_data += data
+
+                                if sasl_buffer_length == -1:  # the first 4 bytes of a SASL buffer hold the payload length
+                                    if len(sasl_received_data) >= 4:
+                                        # Remove the sizeOf(encoded_message + signature + 0x0001 + secNum) from data.
+                                        sasl_buffer_length = int.from_bytes(sasl_received_data[0:4], "big")
+                                        self.connection.strategy._check_declared_message_size(sasl_buffer_length)
+                                        sasl_received_data = sasl_received_data[4:]
+                                        sasl_total_bytes_recieved = len(sasl_received_data)
+                                    else:  # length prefix not completely received yet, wait for more data
+                                        self.connection.strategy._check_pending_buffer_size(len(sasl_received_data))
+                                else:
+                                    sasl_total_bytes_recieved += len(data)
+
+                                if sasl_buffer_length != -1:
+                                    if sasl_total_bytes_recieved < sasl_buffer_length:
+                                        self.connection.strategy._check_pending_buffer_size(len(sasl_received_data))
+                                    if sasl_total_bytes_recieved >= sasl_buffer_length:
+                                        # When the LDAP response is splitted accross multiple TCP packets, the SASL buffer length is equal to the MTU of each packet..Which is usually not equal to self.socket_size
+                                        # This means that the end of one SASL packet/beginning of one other....could be located in the middle of data
+                                        # We are using "sasl_received_data" instead of "data" & "unprocessed" for this reason
+                                        sasl_next_packet = sasl_received_data[sasl_buffer_length:]  # the last "data" variable may contain another sasl packet. We'll process it at the next iteration.
+
+                                        # structure of messages when LDAP signing is enabled : sizeOf(encoded_message + signature + 0x0001 + secNum) + encoded_message + signature + 0x0001 + secNum
+                                        sasl_sec_num = sasl_received_data[sasl_buffer_length - 4:sasl_buffer_length]
+                                        sasl_received_data = sasl_received_data[:sasl_buffer_length-6] # Removing secNum and the message type number to fit also encryption
+                                        sasl_buffer_length = len(sasl_received_data) # We can do that because len(ciphertext) == len(plaintext) for RC4
+                                        sasl_signature = sasl_received_data[sasl_buffer_length - 10:]
+                                        sasl_received_data = sasl_received_data[:sasl_buffer_length - 10]  # retrieve encoded_message
+                                        kis = self.connection._digest_md5_kis  # renamed to lowercase GC
+                                        calculated_signature = bytes.fromhex(md5_hmac(kis, sasl_sec_num + sasl_received_data)[0:20])
+                                        if sasl_signature != calculated_signature:
+                                            raise LDAPSignatureVerificationFailedError("Signature verification failed for the recieved LDAP message number " + str(int.from_bytes(sasl_sec_num, 'big')) + ". Expected signature " + calculated_signature.hex() + " but got " + sasl_signature.hex() + ".")
+                                        sasl_total_bytes_recieved = 0
+                                        sasl_buffer_length = -1  # wait for the length prefix of the next SASL buffer
+                                        unprocessed += sasl_received_data
+                                        sasl_received_data = b''
                             else:
-                                self.connection.last_error = 'no Tls object defined in Server'
+                                unprocessed += data
+                            data = b''
+                        else:
+                            listen = False
+                    length = self.connection.strategy._checked_ldap_message_size(unprocessed)
+                    if length == -1 or len(unprocessed) < length:
+                        get_more_data = True
+                    elif len(unprocessed) >= length:  # add message to message list
+                        if self.connection.usage:
+                            self.connection._usage.update_received_message(length)
+                            if log_enabled(NETWORK):
+                                log(NETWORK, 'received %d bytes via <%s>', length, self.connection)
+                        if self.connection.fast_decoder:
+                            ldap_resp = decode_message_fast(unprocessed[:length])
+                            dict_response = self.connection.strategy.decode_response_fast(ldap_resp)
+                        else:
+                            ldap_resp = decoder.decode(unprocessed[:length], asn1Spec=LDAPMessage())[0]
+                            dict_response = self.connection.strategy.decode_response(ldap_resp)
+                        message_id = int(ldap_resp['messageID'])
+                        if log_enabled(NETWORK):
+                            log(NETWORK, 'received 1 ldap message via <%s>', self.connection)
+                        if log_enabled(EXTENDED):
+                            log(EXTENDED, 'ldap message received via <%s>:%s', self.connection, format_ldap_message(ldap_resp, '<<'))
+                        if dict_response['type'] == 'extendedResp' and (dict_response['responseName'] == '1.3.6.1.4.1.1466.20037' or hasattr(self.connection, '_awaiting_for_async_start_tls')):
+                            if dict_response['result'] == 0:  # StartTls in progress
+                                if self.connection.server.tls:
+                                    self.connection.server.tls._start_tls(self.connection)
+                                else:
+                                    self.connection.last_error = 'no Tls object defined in Server'
+                                    if log_enabled(ERROR):
+                                        log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
+                                    raise LDAPSSLConfigurationError(self.connection.last_error)
+                            else:
+                                self.connection.last_error = 'asynchronous StartTls failed'
                                 if log_enabled(ERROR):
                                     log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-                                raise LDAPSSLConfigurationError(self.connection.last_error)
-                        else:
-                            self.connection.last_error = 'asynchronous StartTls failed'
-                            if log_enabled(ERROR):
-                                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-                            raise LDAPStartTLSError(self.connection.last_error)
-                        del self.connection._awaiting_for_async_start_tls
-                    if message_id != 0:  # 0 is reserved for 'Unsolicited Notification' from server as per RFC4511 (paragraph 4.4)
-                        with self.connection.strategy.async_lock:
-                            if message_id in self.connection.strategy._responses:
-                                self.connection.strategy._responses[message_id].append(dict_response)
-                            else:
-                                self.connection.strategy._responses[message_id] = [dict_response]
-                            if dict_response['type'] not in ['searchResEntry', 'searchResRef', 'intermediateResponse']:
-                                self.connection.strategy._responses[message_id].append(RESPONSE_COMPLETE)
-                                self.connection.strategy.set_event_for_message(message_id)
+                                raise LDAPStartTLSError(self.connection.last_error)
+                            del self.connection._awaiting_for_async_start_tls
+                        if message_id != 0:  # 0 is reserved for 'Unsolicited Notification' from server as per RFC4511 (paragraph 4.4)
+                            with self.connection.strategy.async_lock:
+                                if message_id in self.connection.strategy._responses:
+                                    self.connection.strategy._responses[message_id].append(dict_response)
+                                else:
+                                    self.connection.strategy._responses[message_id] = [dict_response]
+                                if dict_response['type'] not in ['searchResEntry', 'searchResRef', 'intermediateResponse']:
+                                    self.connection.strategy._responses[message_id].append(RESPONSE_COMPLETE)
+                                    self.connection.strategy.set_event_for_message(message_id)
 
-                        if self.connection.strategy.can_stream:  # for AsyncStreamStrategy, used for PersistentSearch
-                            self.connection.strategy.accumulate_stream(message_id, dict_response)
-                        unprocessed = unprocessed[length:]
-                        get_more_data = False if unprocessed else True
-                        listen = True if self.connection.listening or unprocessed else False
-                    else:  # Unsolicited Notification
-                        if dict_response['responseName'] == '1.3.6.1.4.1.1466.20036':  # Notice of Disconnection as per RFC4511 (paragraph 4.4.1)
-                            listen = False
-                        else:
-                            self.connection.last_error = 'unknown unsolicited notification from server'
-                            if log_enabled(ERROR):
-                                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-                            raise LDAPStartTLSError(self.connection.last_error)
+                            if self.connection.strategy.can_stream:  # for AsyncStreamStrategy, used for PersistentSearch
+                                self.connection.strategy.accumulate_stream(message_id, dict_response)
+                            unprocessed = unprocessed[length:]
+                            get_more_data = False if unprocessed else True
+                            listen = True if self.connection.listening or unprocessed else False
+                        else:  # Unsolicited Notification
+                            if dict_response['responseName'] == '1.3.6.1.4.1.1466.20036':  # Notice of Disconnection as per RFC4511 (paragraph 4.4.1)
+                                listen = False
+                            else:
+                                self.connection.last_error = 'unknown unsolicited notification from server'
+                                if log_enabled(ERROR):
+                                    log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
+                                raise LDAPStartTLSError(self.connection.last_error)
+            except LDAPMessageSizeLimitError as e:
+                self.connection.last_error = str(e)
+                self.connection.strategy._receiver_exception = e
+                if log_enabled(ERROR):
+                    log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
+                with self.connection.strategy.event_lock:  # wake up any thread waiting for a response so the limit error can be raised
+                    for event in self.connection.strategy._events.values():
+                        event.set()
             self.connection.strategy.close()
 
     def __init__(self, ldap_connection):
@@ -195,6 +217,7 @@ class AsyncStrategy(BaseStrategy):
         self.async_lock = Lock()
         self.event_lock = Lock()
         self._events = {}
+        self._receiver_exception = None  # set when the receiver thread terminates the connection for a receive limit violation
 
     def open(self, reset_usage=True, read_server_info=True):
         """
@@ -203,6 +226,7 @@ class AsyncStrategy(BaseStrategy):
         with self.connection.connection_lock:
             self._responses = dict()
             self._requests = dict()
+            self._receiver_exception = None
             BaseStrategy.open(self, reset_usage, read_server_info)
 
         if read_server_info:
@@ -283,6 +307,8 @@ class AsyncStrategy(BaseStrategy):
         # In this stage we could ensure the response is already there
         self._events.pop(message_id)
         with self.async_lock:
+            if self._receiver_exception is not None:  # the receiver thread terminated the connection for a receive limit violation
+                raise self._receiver_exception
             return self._responses.pop(message_id)
 
     def receiving(self):

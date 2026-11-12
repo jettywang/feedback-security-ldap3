@@ -2,6 +2,8 @@
     - fixed IndexError in auto_range search when response has no ranged attributes
     - fixed TypeError in format_ad_timedelta with malformed AD timestamps
     - Allow empty base for mocks
+    - added per-connection max_message_size and max_pending_buffer limits (with MAX_MESSAGE_SIZE and MAX_PENDING_BUFFER config parameters) to bound the memory used by untrusted server responses while receiving, for both plain BER and SASL security layer messages; violations raise LDAPMessageSizeLimitError and terminate the connection
+    - fixed SASL security layer reassembly when the 4-byte buffer length prefix or multiple SASL packets are split across read blocks
 
 # 2.10.2rc3 . 2025.04.19
     - tested against Python 3.13

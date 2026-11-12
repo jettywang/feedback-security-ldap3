@@ -539,6 +539,10 @@ class LDAPSocketSendError(LDAPCommunicationError, socket.error):
     pass
 
 
+class LDAPMessageSizeLimitError(LDAPSocketReceiveError):
+    pass
+
+
 class LDAPSessionTerminatedByServerError(LDAPCommunicationError):
     pass
 

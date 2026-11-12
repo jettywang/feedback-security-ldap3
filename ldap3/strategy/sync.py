@@ -26,7 +26,7 @@
 import socket, base64
 
 from .. import SEQUENCE_TYPES, get_config_parameter, DIGEST_MD5, NTLM, ENCRYPT, GSSAPI
-from ..core.exceptions import LDAPSocketReceiveError, communication_exception_factory, LDAPExceptionError, LDAPExtensionError, LDAPOperationResult, LDAPSignatureVerificationFailedError
+from ..core.exceptions import LDAPSocketReceiveError, communication_exception_factory, LDAPExceptionError, LDAPExtensionError, LDAPOperationResult, LDAPSignatureVerificationFailedError, LDAPMessageSizeLimitError
 from ..strategy.base import BaseStrategy, SESSION_TERMINATED_BY_SERVER, RESPONSE_COMPLETE, TRANSACTION_ERROR
 from ..protocol.rfc4511 import LDAPMessage
 from ..utils.log import log, log_enabled, ERROR, NETWORK, EXTENDED, format_ldap_message
@@ -84,88 +84,111 @@ class SyncStrategy(BaseStrategy):
         # sasl_signature = b'' # not needed here? GC
         # sasl_sec_num = b'' # used to verify the signature  # not needed here, reformatted to lowercase GC
         sasl_buffer_length = -1  # added, not initialized? GC
-        while receiving:
-            if get_more_data:
-                try:
-                    data = self.connection.socket.recv(self.socket_size)
-                except (OSError, socket.error, AttributeError) as e:
-                    self.connection.last_error = 'error receiving data: ' + str(e)
-                    try:  # try to close the connection before raising exception
-                        self.close()
-                    except (socket.error, LDAPExceptionError):
-                        pass
-                    if log_enabled(ERROR):
-                        log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
-                    # raise communication_exception_factory(LDAPSocketReceiveError, exc)(self.connection.last_error)
-                    raise communication_exception_factory(LDAPSocketReceiveError, type(e)(str(e)))(self.connection.last_error)
+        try:
+            while receiving:
+                if get_more_data:
+                    if sasl_next_packet:  # a buffered SASL packet is waiting to be processed, don't read more data from the socket
+                        data = b''
+                    else:
+                        try:
+                            data = self.connection.socket.recv(self.socket_size)
+                        except (OSError, socket.error, AttributeError) as e:
+                            self.connection.last_error = 'error receiving data: ' + str(e)
+                            try:  # try to close the connection before raising exception
+                                self.close()
+                            except (socket.error, LDAPExceptionError):
+                                pass
+                            if log_enabled(ERROR):
+                                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
+                            # raise communication_exception_factory(LDAPSocketReceiveError, exc)(self.connection.last_error)
+                            raise communication_exception_factory(LDAPSocketReceiveError, type(e)(str(e)))(self.connection.last_error)
 
-                # If we are using DIGEST-MD5 and LDAP signing is set : verify & remove the signature from the message
-                if (self.connection._digest_md5_kis or self.connection.session_security == ENCRYPT) and not self.connection.sasl_in_progress:
-                    data = sasl_next_packet + data
+                    # If we are using DIGEST-MD5 and LDAP signing is set : verify & remove the signature from the message
+                    if (self.connection._digest_md5_kis or self.connection.session_security == ENCRYPT) and not self.connection.sasl_in_progress:
+                        data = sasl_next_packet + data
+                        sasl_next_packet = b''
+                        sasl_received_data += data
 
-                    if sasl_received_data == b'' or sasl_next_packet:
-                        # Remove the sizeOf(encoded_message + signature + 0x0001 + secNum) from data.
-                        sasl_buffer_length = int.from_bytes(data[0:4], "big")
-                        data = data[4:]
-                    sasl_next_packet = b''
-                    sasl_total_bytes_received += len(data)
-                    sasl_received_data += data
+                        if sasl_buffer_length == -1:  # the first 4 bytes of a SASL buffer hold the payload length
+                            if len(sasl_received_data) >= 4:
+                                # Remove the sizeOf(encoded_message + signature + 0x0001 + secNum) from data.
+                                sasl_buffer_length = int.from_bytes(sasl_received_data[0:4], "big")
+                                self._check_declared_message_size(sasl_buffer_length)
+                                sasl_received_data = sasl_received_data[4:]
+                                sasl_total_bytes_received = len(sasl_received_data)
+                            else:  # length prefix not completely received yet, wait for more data
+                                self._check_pending_buffer_size(len(sasl_received_data))
+                        else:
+                            sasl_total_bytes_received += len(data)
 
-                    if sasl_total_bytes_received >= sasl_buffer_length:
-                        # When the LDAP response is splitted accross multiple TCP packets, the SASL buffer length is equal to the MTU of each packet..Which is usually not equal to self.socket_size
-                        # This means that the end of one SASL packet/beginning of one other....could be located in the middle of data
-                        # We are using "sasl_received_data" instead of "data" & "unprocessed" for this reason
+                        if sasl_buffer_length != -1:
+                            if sasl_total_bytes_received < sasl_buffer_length:
+                                self._check_pending_buffer_size(len(sasl_received_data))
+                            if sasl_total_bytes_received >= sasl_buffer_length:
+                                # When the LDAP response is splitted accross multiple TCP packets, the SASL buffer length is equal to the MTU of each packet..Which is usually not equal to self.socket_size
+                                # This means that the end of one SASL packet/beginning of one other....could be located in the middle of data
+                                # We are using "sasl_received_data" instead of "data" & "unprocessed" for this reason
 
-                        sasl_next_packet = sasl_received_data[sasl_buffer_length:]  # the last "data" variable may contain another sasl packet. We'll process it at the next iteration.
+                                sasl_next_packet = sasl_received_data[sasl_buffer_length:]  # the last "data" variable may contain another sasl packet. We'll process it at the next iteration.
 
-                        if self.connection.sasl_mechanism == DIGEST_MD5:
-                            # structure of messages when LDAP signing is enabled : sizeOf(encoded_message + signature + 0x0001 + secNum) + encoded_message + signature + 0x0001 + secNum
-                            sasl_sec_num = sasl_received_data[sasl_buffer_length - 4:sasl_buffer_length]
-                            sasl_received_data = sasl_received_data[:sasl_buffer_length-6] # Removing secNum and the message type number to fit also encryption
-                            sasl_buffer_length = len(sasl_received_data) # We can do that because len(ciphertext) == len(plaintext) for RC4
-                            if self.connection._digest_md5_kcs_cipher:
-                                # structure of messages when LDAP encryption is enabled: sizeOf(ciphertext + 0x0001 + secNum) + CIPHER(encoded_message + pad+ signature) + 0x0001 + secNum
-                                sasl_received_data = self.connection._digest_md5_kcs_cipher.decrypt(sasl_received_data)
-                            sasl_signature = sasl_received_data[sasl_buffer_length - 10:]
-                            sasl_received_data = sasl_received_data[:sasl_buffer_length - 10]  # retrieve encoded_message
-                            kis = self.connection._digest_md5_kis  # renamed to lowercase GC
-                            calculated_signature = bytes.fromhex(md5_hmac(kis, sasl_sec_num + sasl_received_data)[0:20])
-                            if sasl_signature != calculated_signature:
-                                raise LDAPSignatureVerificationFailedError("Signature verification failed for the recieved LDAP message number " + str(int.from_bytes(sasl_sec_num, 'big')) + ". Expected signature " + calculated_signature.hex() + " but got " + sasl_signature.hex() + ".")
- 
-                        elif self.connection.authentication == NTLM:
-                            sasl_received_data = self.connection.ntlm_client.unseal(sasl_received_data[:sasl_buffer_length])
-                        
-                        elif self.connection.sasl_mechanism == GSSAPI:
-                            if posix_gssapi_unavailable:
-                                import winkerberos
-                                winkerberos.authGSSClientUnwrap(self.connection.krb_ctx, base64.b64encode(sasl_received_data[:sasl_buffer_length]).decode('utf-8'))
-                                sasl_received_data = base64.b64decode(winkerberos.authGSSClientResponse(self.connection.krb_ctx))
-                            else:
-                                sasl_received_data = self.connection.krb_ctx.unwrap(sasl_received_data[:sasl_buffer_length]).message
-                        
-                        sasl_total_bytes_received = 0
-                        unprocessed += sasl_received_data
-                        sasl_received_data = b''
+                                if self.connection.sasl_mechanism == DIGEST_MD5:
+                                    # structure of messages when LDAP signing is enabled : sizeOf(encoded_message + signature + 0x0001 + secNum) + encoded_message + signature + 0x0001 + secNum
+                                    sasl_sec_num = sasl_received_data[sasl_buffer_length - 4:sasl_buffer_length]
+                                    sasl_received_data = sasl_received_data[:sasl_buffer_length-6] # Removing secNum and the message type number to fit also encryption
+                                    sasl_buffer_length = len(sasl_received_data) # We can do that because len(ciphertext) == len(plaintext) for RC4
+                                    if self.connection._digest_md5_kcs_cipher:
+                                        # structure of messages when LDAP encryption is enabled: sizeOf(ciphertext + 0x0001 + secNum) + CIPHER(encoded_message + pad+ signature) + 0x0001 + secNum
+                                        sasl_received_data = self.connection._digest_md5_kcs_cipher.decrypt(sasl_received_data)
+                                    sasl_signature = sasl_received_data[sasl_buffer_length - 10:]
+                                    sasl_received_data = sasl_received_data[:sasl_buffer_length - 10]  # retrieve encoded_message
+                                    kis = self.connection._digest_md5_kis  # renamed to lowercase GC
+                                    calculated_signature = bytes.fromhex(md5_hmac(kis, sasl_sec_num + sasl_received_data)[0:20])
+                                    if sasl_signature != calculated_signature:
+                                        raise LDAPSignatureVerificationFailedError("Signature verification failed for the recieved LDAP message number " + str(int.from_bytes(sasl_sec_num, 'big')) + ". Expected signature " + calculated_signature.hex() + " but got " + sasl_signature.hex() + ".")
+
+                                elif self.connection.authentication == NTLM:
+                                    sasl_received_data = self.connection.ntlm_client.unseal(sasl_received_data[:sasl_buffer_length])
+
+                                elif self.connection.sasl_mechanism == GSSAPI:
+                                    if posix_gssapi_unavailable:
+                                        import winkerberos
+                                        winkerberos.authGSSClientUnwrap(self.connection.krb_ctx, base64.b64encode(sasl_received_data[:sasl_buffer_length]).decode('utf-8'))
+                                        sasl_received_data = base64.b64decode(winkerberos.authGSSClientResponse(self.connection.krb_ctx))
+                                    else:
+                                        sasl_received_data = self.connection.krb_ctx.unwrap(sasl_received_data[:sasl_buffer_length]).message
+
+                                sasl_total_bytes_received = 0
+                                sasl_buffer_length = -1  # wait for the length prefix of the next SASL buffer
+                                unprocessed += sasl_received_data
+                                sasl_received_data = b''
+                    else:
+                        unprocessed += data
+                if len(data) > 0:
+                    length = self._checked_ldap_message_size(unprocessed)
+                    if length == -1:  # too few data to decode message length
+                        get_more_data = True
+                        continue
+                    if len(unprocessed) < length:
+                        get_more_data = True
+                    else:
+                        if log_enabled(NETWORK):
+                            log(NETWORK, 'received %d bytes via <%s>', len(unprocessed[:length]), self.connection)
+                        messages.append(unprocessed[:length])
+                        unprocessed = unprocessed[length:]
+                        get_more_data = False
+                        if len(unprocessed) == 0 and not sasl_next_packet:
+                            receiving = False
                 else:
-                    unprocessed += data
-            if len(data) > 0:
-                length = BaseStrategy.compute_ldap_message_size(unprocessed)
-                if length == -1:  # too few data to decode message length
-                    get_more_data = True
-                    continue
-                if len(unprocessed) < length:
-                    get_more_data = True
-                else:
-                    if log_enabled(NETWORK):
-                        log(NETWORK, 'received %d bytes via <%s>', len(unprocessed[:length]), self.connection)
-                    messages.append(unprocessed[:length])
-                    unprocessed = unprocessed[length:]
-                    get_more_data = False
-                    if len(unprocessed) == 0:
-                        receiving = False
-            else:
-                receiving = False
+                    receiving = False
+        except LDAPMessageSizeLimitError as e:
+            self.connection.last_error = str(e)
+            try:  # try to close the connection before raising exception
+                self.close()
+            except (socket.error, LDAPExceptionError):
+                pass
+            if log_enabled(ERROR):
+                log(ERROR, '<%s> for <%s>', self.connection.last_error, self.connection)
+            raise
 
         if log_enabled(NETWORK):
             log(NETWORK, 'received %d ldap messages via <%s>', len(messages), self.connection)
