@@ -62,7 +62,6 @@ from ..protocol.microsoft import DirSyncControlResponseValue
 from ..utils.log import log, log_enabled, ERROR, BASIC, PROTOCOL, NETWORK, EXTENDED, format_ldap_message
 from ..utils.asn1 import encode, decoder, ldap_result_to_dict_fast, decode_sequence
 from ..utils.conv import to_unicode
-from ..protocol.sasl.digestMd5 import md5_h, md5_hmac
 from ..protocol.sasl.kerberos import posix_gssapi_unavailable
 
 SESSION_TERMINATED_BY_SERVER = 'TERMINATED_BY_SERVER'
@@ -891,17 +890,9 @@ class BaseStrategy(object):
         try:
             encoded_message = encode(ldap_message)
             if self.connection.sasl_mechanism == DIGEST_MD5 and self.connection._digest_md5_kic and not self.connection.sasl_in_progress:
-                # If we are using DIGEST-MD5 and LDAP signing is enabled: add a signature to the message
-                sec_num = self.connection._digest_md5_sec_num  # added underscore GC
-                kic = self.connection._digest_md5_kic  # lowercase GC
-                signature = bytes.fromhex(md5_hmac(kic, int(sec_num).to_bytes(4, 'big') + encoded_message)[0:20])
-                payload = encoded_message + signature
-                if self.connection._digest_md5_kcc_cipher:
-                    payload = self.connection._digest_md5_kcc_cipher.encrypt(payload)
-                # RFC 2831 sign: encoded_message = sizeOf(encoded_message + signature + 0x0001 + secNum) + encoded_message + signature + 0x0001 + secNum
-                # RFC 2831 encrypt: encoded_message = sizeOf(ciphertext + 0x0001 +secNum) + CIPHER(encoded_message + pad + signature) + 0x0001 + secNum
-                encoded_message = int(len(payload) + 2 + 4).to_bytes(4, 'big') + payload + int(1).to_bytes(2, 'big') + int(sec_num).to_bytes(4, 'big')
-                self.connection._digest_md5_sec_num += 1
+                # DIGEST-MD5 integrity/confidentiality: frame the BER message with
+                # a signature, the 0x0001 padding marker and the send sequence number.
+                encoded_message = self.connection._digest_md5_security_layer.protect(encoded_message)
             elif self.connection.session_security == ENCRYPT and not self.connection.sasl_in_progress:
                 if self.connection.authentication == NTLM:
                     # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/115f9c7d-bc30-4262-ae96-254555c14ea6

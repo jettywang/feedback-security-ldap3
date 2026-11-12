@@ -139,6 +139,8 @@ def sasl_digest_md5(connection, controls):
     if qop != b'auth':
         connection._digest_md5_kis = md5_h(md5_h(a1) + b"Digest session key to server-to-client signing key magic constant")
         connection._digest_md5_kic = md5_h(md5_h(a1) + b"Digest session key to client-to-server signing key magic constant")
+        from .securityLayer import DigestMd5SecurityLayer
+        connection._digest_md5_security_layer = DigestMd5SecurityLayer(connection)
     if qop == b'auth-conf':
         connection._digest_md5_kcs_cipher = ARC4.new(md5_h(md5_h(a1) + b"Digest H(A1) to server-to-client sealing key magic constant"))
         connection._digest_md5_kcc_cipher = ARC4.new(md5_h(md5_h(a1) + b"Digest H(A1) to client-to-server sealing key magic constant"))

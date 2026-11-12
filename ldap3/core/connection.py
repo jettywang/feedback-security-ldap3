@@ -297,6 +297,7 @@ class Connection(object):
             self._digest_md5_kcc_cipher = None
             self._digest_md5_kcs_cipher = None
             self._digest_md5_sec_num = 0
+            self._digest_md5_security_layer = None
             self.krb_ctx = None
             self.krb_wrap_size_limit = None
 

@@ -401,6 +401,26 @@ class LDAPSignatureVerificationFailedError(LDAPExceptionError):
     pass
 
 
+class LDAPSecurityLayerError(LDAPExceptionError):
+    """Base error for failures of an established SASL security layer.
+
+    Raising one of these errors permanently invalidates the security
+    session: the connection must be closed and no protected data received
+    before the failure may be delivered as an authenticated LDAP message.
+    """
+    pass
+
+
+class LDAPSecurityLayerFrameError(LDAPSecurityLayerError):
+    """A received security layer frame is malformed, oversized or truncated."""
+    pass
+
+
+class LDAPSecurityLayerSequenceError(LDAPSecurityLayerError):
+    """A received frame has a duplicate, out-of-order or exhausted sequence number."""
+    pass
+
+
 # connection exceptions
 class LDAPBindError(LDAPExceptionError):
     pass
