@@ -32,10 +32,21 @@ from Cryptodome.Cipher import ARC4
 from ... import SEQUENCE_TYPES, ENCRYPT, SIGN
 from ...protocol.sasl.sasl import abort_sasl_negotiation, send_sasl_negotiation, random_hex_string
 from ...core.exceptions import LDAPSASLBindInProgressError
+from ...core.results import RESULT_SUCCESS
 
 
 STATE_KEY = 0
 STATE_VALUE = 1
+
+
+def reset_digest_md5_security_context(connection):
+    # removes any half-completed identity and security layer state so a failed
+    # negotiation can never leave signing/sealing material on the connection
+    connection._digest_md5_kic = None
+    connection._digest_md5_kis = None
+    connection._digest_md5_kcc_cipher = None
+    connection._digest_md5_kcs_cipher = None
+    connection._digest_md5_sec_num = 0
 
 
 def md5_h(value):
@@ -83,11 +94,13 @@ def sasl_digest_md5(connection, controls):
     if 'saslCreds' in result and result['saslCreds'] is not None:
         server_directives = decode_directives(result['saslCreds'])
     else:
+        reset_digest_md5_security_context(connection)
         return None
 
     if 'realm' not in server_directives or 'nonce' not in server_directives or 'algorithm' not in server_directives:  # mandatory directives, as per RFC2831
         abort_sasl_negotiation(connection, controls)
-        return None
+        reset_digest_md5_security_context(connection)
+        return connection.result
     
 
     # step Two of RFC2831
@@ -108,6 +121,7 @@ def sasl_digest_md5(connection, controls):
                     break
             if cipher == b'':
                 abort_sasl_negotiation(connection, controls)
+                reset_digest_md5_security_context(connection)
                 raise LDAPSASLBindInProgressError(f'Cipher negociation failed, Client only supports {supported_ciphers} and Server {server_directives["cipher"]}')
             qop = b'auth-conf'
 
@@ -146,7 +160,16 @@ def sasl_digest_md5(connection, controls):
 
     digest_response += b'response="' + md5_hex(md5_kd(md5_hex(md5_h(a1)), b':'.join([nonce, b'00000001', cnonce, qop, md5_hex(md5_h(a2))]))) + b'"'
 
-    result = send_sasl_negotiation(connection, controls, digest_response)
+    try:
+        result = send_sasl_negotiation(connection, controls, digest_response)
+    except Exception:
+        # A transport/timeout failure during the second exchange must not
+        # leave the signing/sealing material derived above on the connection.
+        reset_digest_md5_security_context(connection)
+        raise
+    if not result or result.get('result') != RESULT_SUCCESS:
+        # server rejected the response proof: the negotiated keys must not outlive the failed bind
+        reset_digest_md5_security_context(connection)
     return result
 
 

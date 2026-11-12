@@ -148,7 +148,8 @@ def abort_sasl_negotiation(connection, controls):
     if connection.strategy.sync:
         result = connection.result
     else:
-        result = connection.get_response(response)[0][0]
+        _, result = connection.get_response(response)
+        connection.result = result
 
     return True if result['result'] == RESULT_AUTH_METHOD_NOT_SUPPORTED else False
 
